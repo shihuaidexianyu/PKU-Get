@@ -2,7 +2,7 @@
 
 停止手动下载课程资料。让 PKU-Get 帮你完成这件事。
 
-![image-20251124174414777](C:\Users\robin\AppData\Roaming\Typora\typora-user-images\image-20251124174414777.png)
+![image-20251124174414777](./gui/public/1.png)
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20-lightgrey.svg)](https://github.com/yourusername/PKU-AutoDownloader)
@@ -31,7 +31,7 @@
 - 实时下载进度追踪
 - 一目了然的文件统计
 
-![image-20251124175243472](C:\Users\robin\AppData\Roaming\Typora\typora-user-images\image-20251124175243472.png)
+![image-20251124175243472](./gui/public/2.png)
 
 #### ⚡ **智能下载引擎**
 - **并发下载**: 同时下载多个文件，速度飞快
@@ -77,7 +77,7 @@
 - ⏭️ 跳过的文件（已存在）
 - ❌ 失败的文件及错误信息
 
-![image-20251124175628641](C:\Users\robin\AppData\Roaming\Typora\typora-user-images\image-20251124175628641.png)
+![image-20251124175628641](./gui/public/3.png)
 
 #### 文件管理
 

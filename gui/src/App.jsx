@@ -3,6 +3,8 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Terminal, Download, Settings, Folder, LogIn, LogOut, Check, X, Play, RefreshCw, Edit2, HardDrive, Clock, FileText, Search, Filter, Sun, Moon, ChevronUp, ChevronDown, HelpCircle, FolderOpen, ExternalLink, Github, Bell } from 'lucide-react';
 import clsx from 'clsx';
 import { t } from './i18n';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 // Mock API
 const mockApi = {
@@ -132,10 +134,25 @@ function NotificationModal({ course, onClose, lang }) {
               <div className="text-sm text-slate-500 mb-6 pb-4 border-b border-slate-200 dark:border-slate-700">
                 {selectedNotification.date}
               </div>
-              <div className="prose dark:prose-invert max-w-none">
-                <pre className="whitespace-pre-wrap font-sans text-slate-700 dark:text-slate-300">
+              <div className="prose dark:prose-invert max-w-none prose-img:rounded-lg prose-img:shadow-md">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    img: ({ node, ...props }) => (
+                      <img
+                        {...props}
+                        className="max-w-full h-auto my-4"
+                        loading="lazy"
+                        onError={(e) => {
+                          e.target.style.display = 'none';
+                          console.error('Failed to load image:', props.src);
+                        }}
+                      />
+                    )
+                  }}
+                >
                   {selectedNotification.content}
-                </pre>
+                </ReactMarkdown>
               </div>
             </div>
           ) : (

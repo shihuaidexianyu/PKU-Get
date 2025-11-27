@@ -835,6 +835,10 @@ class Downloader:
                 return
 
             local_dir.mkdir(parents=True, exist_ok=True)
+            # Create assets directory for images
+            assets_dir = local_dir / "assets"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            
             count = 0
 
             for item in items:
@@ -864,43 +868,30 @@ class Downloader:
                         # Fallback to current time if date parsing fails
                         date_str = datetime.now().strftime("%Y-%m-%d")
 
-                # 3. Extract Content
-                # Content is usually in a div following the header/details, often with no class or 'vtbegenerated'
-                # We'll look for the container that holds the actual message
-                content_html = ""
-                # Blackboard often puts content in a div with id starting with 'announcementMsg_'
+                # 3. Extract Content and convert HTML to Markdown
                 msg_div = item.find('div', id=re.compile(r'^announcementMsg_'))
                 if not msg_div:
-                    # Fallback: look for any div that looks like content
-                    pass
+                    # Fallback: try to find content div
+                    msg_div = item.find('div', class_='vtbegenerated')
                 
                 if msg_div:
-                    # Convert HTML to basic Markdown-ish text
-                    content_text = msg_div.get_text('\n', strip=True)
-                    
-                    # Also try to find links/attachments in the message
-                    links = msg_div.find_all('a', href=True)
-                    attachments = []
-                    for link in links:
-                        href = link['href']
-                        text = link.get_text(strip=True)
-                        full_link = urljoin(url, href)
-                        attachments.append(f"[{text}]({full_link})")
-                    
-                    if attachments:
-                        content_text += "\n\n### Attachments\n" + "\n".join(f"- {a}" for a in attachments)
+                    # Download images first and replace URLs
+                    safe_title = self._sanitize_name(title)
+                    img_prefix = f"{date_str}_{safe_title}"
+                    content_markdown = self._html_to_markdown_with_images(
+                        msg_div, url, assets_dir, img_prefix
+                    )
                 else:
-                    content_text = "[Could not extract content]"
+                    content_markdown = "[Could not extract content]"
 
                 # 4. Save as Markdown
-                safe_title = self._sanitize_name(title)
                 filename = f"{date_str}_{safe_title}.md"
                 file_path = local_dir / filename
                 
                 md_content = f"# {title}\n\n"
                 if meta_info:
                     md_content += f"> {' | '.join(meta_info)}\n\n"
-                md_content += content_text
+                md_content += content_markdown
                 
                 try:
                     with open(file_path, 'w', encoding='utf-8') as f:
@@ -915,3 +906,116 @@ class Downloader:
 
         except Exception as e:
             logger.error(f"    Error processing notifications at {url}: {e}")
+    
+    def _html_to_markdown_with_images(self, html_elem, base_url: str, assets_dir: Path, img_prefix: str) -> str:
+        """Convert HTML content to Markdown, downloading images and updating references."""
+        # Find and download all images
+        images = html_elem.find_all('img')
+        img_count = 0
+        
+        for img in images:
+            img_src = img.get('src')
+            if not img_src:
+                continue
+                
+            # Convert relative URLs to absolute
+            img_url = urljoin(base_url, img_src)
+            
+            # Download image
+            try:
+                img_response = self.session.get(img_url, timeout=30)
+                img_response.raise_for_status()
+                
+                # Determine file extension from content type or URL
+                content_type = img_response.headers.get('Content-Type', '')
+                ext = mimetypes.guess_extension(content_type.split(';')[0].strip())
+                if not ext or ext == '.jpe':
+                    # Fallback to URL extension
+                    url_ext = Path(img_url.split('?')[0]).suffix
+                    ext = url_ext if url_ext else '.jpg'
+                
+                # Generate unique filename
+                img_filename = f"{img_prefix}_img{img_count}{ext}"
+                img_path = assets_dir / img_filename
+                
+                # Save image
+                with open(img_path, 'wb') as f:
+                    f.write(img_response.content)
+                
+                # Replace img tag with markdown image syntax
+                img_alt = img.get('alt', 'image')
+                # Use relative path from notification markdown file to assets folder
+                img_markdown = f"![{img_alt}](assets/{img_filename})"
+                img.replace_with(img_markdown)
+                
+                img_count += 1
+                logger.debug(f"        Downloaded image: {img_filename}")
+                
+            except Exception as e:
+                logger.warning(f"        Failed to download image {img_url}: {e}")
+                # Keep the original URL as fallback
+                img_alt = img.get('alt', 'image')
+                img.replace_with(f"![{img_alt}]({img_url})")
+        
+        # Convert HTML to text-based markdown
+        content = self._simple_html_to_markdown(html_elem)
+        return content
+    
+    def _simple_html_to_markdown(self, html_elem) -> str:
+        """Convert HTML to simple markdown format."""
+        # Make a copy to avoid modifying the original
+        from copy import copy
+        
+        # Convert <p> to paragraphs
+        for p in html_elem.find_all('p'):
+            p.insert_before('\n')
+            p.insert_after('\n')
+        
+        # Convert <br> to newlines
+        for br in html_elem.find_all('br'):
+            br.replace_with('\n')
+        
+        # Convert <strong> and <b> to bold
+        for tag in html_elem.find_all(['strong', 'b']):
+            text = tag.get_text()
+            tag.replace_with(f"**{text}**")
+        
+        # Convert <em> and <i> to italic
+        for tag in html_elem.find_all(['em', 'i']):
+            text = tag.get_text()
+            tag.replace_with(f"*{text}*")
+        
+        # Convert <a> to markdown links
+        for a in html_elem.find_all('a', href=True):
+            href = a.get('href')
+            text = a.get_text(strip=True)
+            if text:
+                a.replace_with(f"[{text}]({href})")
+            else:
+                a.replace_with(href)
+        
+        # Convert headings
+        for i in range(1, 7):
+            for h in html_elem.find_all(f'h{i}'):
+                text = h.get_text(strip=True)
+                h.replace_with(f"\n{'#' * i} {text}\n")
+        
+        # Convert lists
+        for ul in html_elem.find_all('ul'):
+            for li in ul.find_all('li', recursive=False):
+                li_text = li.get_text(strip=True)
+                li.replace_with(f"- {li_text}\n")
+        
+        for ol in html_elem.find_all('ol'):
+            for idx, li in enumerate(ol.find_all('li', recursive=False), 1):
+                li_text = li.get_text(strip=True)
+                li.replace_with(f"{idx}. {li_text}\n")
+        
+        # Get final text content
+        text = html_elem.get_text('\n')
+        
+        # Clean up excessive newlines
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text.strip()
+

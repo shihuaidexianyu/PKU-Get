@@ -888,6 +888,12 @@ class Downloader:
                 filename = f"{date_str}_{safe_title}.md"
                 file_path = local_dir / filename
                 
+                # Skip if notification already exists
+                if file_path.exists():
+                    logger.info(f"      [SKIP] Notification already exists: {filename}")
+                    self.stats['skipped'] += 1
+                    continue
+                
                 md_content = f"# {title}\n\n"
                 if meta_info:
                     md_content += f"> {' | '.join(meta_info)}\n\n"
@@ -898,9 +904,11 @@ class Downloader:
                         f.write(md_content)
                     count += 1
                     self.stats['notifications_new'] = self.stats.get('notifications_new', 0) + 1
+                    self.stats['downloaded'] += 1
                     logger.info(f"      [NOTE] Saved: {filename}")
                 except Exception as e:
                     logger.error(f"      Failed to save notification {filename}: {e}")
+                    self.stats['failed'] += 1
 
             if count > 0:
                 logger.info(f"    Saved {count} notifications.")

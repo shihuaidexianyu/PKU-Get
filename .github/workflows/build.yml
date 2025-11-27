@@ -49,6 +49,8 @@ jobs:
       
       - name: Build application
         run: uv run python build.py
+        env:
+          PYTHONIOENCODING: utf-8
       
       - name: Verify build output
         shell: bash

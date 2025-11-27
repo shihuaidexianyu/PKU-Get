@@ -876,7 +876,7 @@ class Api:
             gui_logger.error(f"Error opening file: {e}")
             return {'success': False, 'error': str(e)}
 
-    def open_folder(self, course_name):
+    def open_folder(self, course_id):
         """Open course folder in file manager."""
         import subprocess
         import platform
@@ -884,7 +884,20 @@ class Api:
         try:
             config = self.load_config()
             download_dir = Path(config['download_dir']).resolve()
-            folder_path = (download_dir / course_name).resolve()
+            
+            # Find course by ID
+            course = next((c for c in self.courses if c['id'] == course_id), None)
+            if not course:
+                gui_logger.error(f"Course not found: {course_id}")
+                return {'success': False, 'error': 'Course not found'}
+            
+            # Determine folder name (alias or name)
+            folder_name = course.get('alias') or course.get('name')
+            if not folder_name:
+                gui_logger.error(f"Course has no name or alias: {course_id}")
+                return {'success': False, 'error': 'Course has no name'}
+            
+            folder_path = (download_dir / folder_name).resolve()
 
             # Security check: ensure folder is within download directory
             if not str(folder_path).startswith(str(download_dir)):
@@ -905,7 +918,7 @@ class Api:
             else:  # Linux and others
                 subprocess.run(['xdg-open', str(folder_path)], check=True)
 
-            gui_logger.info(f"Opened folder: {course_name}")
+            gui_logger.info(f"Opened folder: {folder_name} (ID: {course_id})")
             return {'success': True}
 
         except subprocess.CalledProcessError as e:

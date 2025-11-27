@@ -11,3 +11,16 @@ dependencies = [
     "selenium>=4.0.0",
     "webdriver-manager>=4.0.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.0.0",
+]
+
+[project.scripts]
+pku-get = "gui:main"
+
+[tool.uv]
+dev-dependencies = [
+    "pyinstaller>=6.0.0",
+]

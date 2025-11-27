@@ -4,16 +4,20 @@ Build script for PKU-Get application
 Usage: uv run build.py
 """
 
-import subprocess
 import sys
-import shutil
-from pathlib import Path
 import io
 
-# Fix encoding issues on Windows
+# Fix encoding issues on Windows - MUST be done before any other code
 if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+    # Reconfigure stdout and stderr to use UTF-8
+    if hasattr(sys.stdout, 'buffer'):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    if hasattr(sys.stderr, 'buffer'):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+
+import subprocess
+import shutil
+from pathlib import Path
 
 def run_command(cmd, cwd=None):
     """Run shell command and print output"""

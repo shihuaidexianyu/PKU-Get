@@ -538,7 +538,9 @@ class Api:
                     })
 
                     gui_logger.info("  Download completed!")
-                    if self._window: self._window.evaluate_js("window.syncComplete()")
+                    new_notifs = downloader.stats.get('notifications_new', 0)
+                    if self._window: 
+                        self._window.evaluate_js(f"window.syncComplete({new_notifs})")
                     return  # 成功，退出重试循环
 
                 except WebDriverException as e:
@@ -912,6 +914,51 @@ class Api:
         except Exception as e:
             gui_logger.error(f"Error opening folder: {e}")
             return {'success': False, 'error': str(e)}
+
+    def get_notification_image(self, course_name, image_path):
+        """Get notification image as base64 data URI for display in webview."""
+        import base64
+        import mimetypes
+        from urllib.parse import unquote
+        
+        try:
+            config = self.load_config()
+            download_dir = Path(config['download_dir']).resolve()
+            
+            # Decode URL-encoded path (e.g., %E8%AF%B7 -> 请)
+            image_path = unquote(image_path)
+            
+            # Construct the full image path
+            # image_path is relative like "assets/2024-11-27_Title_img0.jpg"
+            full_image_path = (download_dir / course_name / "Notifications" / image_path).resolve()
+            
+            # Security check: ensure file is within Notifications directory
+            notifications_dir = (download_dir / course_name / "Notifications").resolve()
+            if not str(full_image_path).startswith(str(notifications_dir)):
+                gui_logger.error(f"Security: Attempted to access file outside Notifications directory: {full_image_path}")
+                return None
+            
+            # Check if file exists
+            if not full_image_path.exists():
+                gui_logger.warning(f"Image not found: {full_image_path}")
+                return None
+            
+            # Read file and encode as base64
+            with open(full_image_path, 'rb') as f:
+                image_data = f.read()
+            
+            # Detect MIME type
+            mime_type = mimetypes.guess_type(str(full_image_path))[0] or 'application/octet-stream'
+            
+            # Create data URI
+            base64_data = base64.b64encode(image_data).decode('utf-8')
+            data_uri = f"data:{mime_type};base64,{base64_data}"
+            
+            return data_uri
+            
+        except Exception as e:
+            gui_logger.error(f"Error loading image {image_path}: {e}")
+            return None
 
     def refresh_stats(self):
         """Refresh local file statistics"""

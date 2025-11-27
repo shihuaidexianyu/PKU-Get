@@ -897,6 +897,7 @@ class Downloader:
                     with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(md_content)
                     count += 1
+                    self.stats['notifications_new'] = self.stats.get('notifications_new', 0) + 1
                     logger.info(f"      [NOTE] Saved: {filename}")
                 except Exception as e:
                     logger.error(f"      Failed to save notification {filename}: {e}")
@@ -913,6 +914,9 @@ class Downloader:
         images = html_elem.find_all('img')
         img_count = 0
         
+        if images:
+            logger.info(f"        Found {len(images)} images in notification.")
+        
         for img in images:
             img_src = img.get('src')
             if not img_src:
@@ -923,6 +927,7 @@ class Downloader:
             
             # Download image
             try:
+                logger.info(f"        Downloading image: {img_url}")
                 img_response = self.session.get(img_url, timeout=30)
                 img_response.raise_for_status()
                 
@@ -949,7 +954,7 @@ class Downloader:
                 img.replace_with(img_markdown)
                 
                 img_count += 1
-                logger.debug(f"        Downloaded image: {img_filename}")
+                logger.info(f"        Saved image to: {img_filename}")
                 
             except Exception as e:
                 logger.warning(f"        Failed to download image {img_url}: {e}")

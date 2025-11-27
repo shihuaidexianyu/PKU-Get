@@ -5,6 +5,7 @@ import clsx from 'clsx';
 import { t } from './i18n';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { NotificationImage } from './NotificationImage';
 
 // Mock API
 const mockApi = {
@@ -138,16 +139,8 @@ function NotificationModal({ course, onClose, lang }) {
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   components={{
-                    img: ({ node, ...props }) => (
-                      <img
-                        {...props}
-                        className="max-w-full h-auto my-4"
-                        loading="lazy"
-                        onError={(e) => {
-                          e.target.style.display = 'none';
-                          console.error('Failed to load image:', props.src);
-                        }}
-                      />
+                    img: ({ node, src, alt, ...props }) => (
+                      <NotificationImage src={src} alt={alt} courseName={course.name} {...props} />
                     )
                   }}
                 >
@@ -163,7 +156,7 @@ function NotificationModal({ course, onClose, lang }) {
           )}
         </div>
       </motion.div>
-    </motion.div>
+    </motion.div >
   );
 }
 

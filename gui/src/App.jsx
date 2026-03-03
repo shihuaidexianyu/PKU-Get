@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Terminal, Download, Settings, Folder, LogIn, LogOut, Check, X, Play, RefreshCw, Edit2, HardDrive, Clock, FileText, Search, Filter, Sun, Moon, ChevronUp, ChevronDown, HelpCircle, FolderOpen, ExternalLink, Github } from 'lucide-react';
+import { Terminal, Download, Settings, Folder, LogIn, LogOut, Check, X, Play, Pause, Square, RefreshCw, Edit2, HardDrive, Clock, FileText, Search, Filter, Sun, Moon, ChevronUp, ChevronDown, HelpCircle, FolderOpen, ExternalLink, Github, Video, Archive } from 'lucide-react';
 import clsx from 'clsx';
 import { t } from './i18n';  // 🔑 导入翻译函数
 
@@ -42,7 +42,18 @@ const mockApi = {
   get_sync_report: async () => null,
   open_folder: async () => ({ success: true }),
   open_file: async () => ({ success: true }),
-  logout: async () => ({ success: true })  // 🔑 添加 logout 方法
+  logout: async () => ({ success: true }),
+  stop_sync: async () => {},
+  pause_sync: async () => ({ paused: true }),
+  fetch_replays: async () => {
+    setTimeout(() => window.replaysFetched?.('mock', [], null), 500);
+  },
+  download_replays_direct: async () => {
+    setTimeout(() => window.replayDownloadFinished?.('mock', true, 'ok'), 500);
+  },
+  refresh_course_info: async () => {
+    setTimeout(() => window.courseInfoRefreshed?.([], null), 800);
+  }
 };
 
 // 🔑 安全的 API 访问函数
@@ -55,7 +66,9 @@ const getApi = () => {
   return mockApi;
 };
 
-function CourseCard({ course, localCount, onUpdate, onOpenFolder, lang }) {
+const replayKeyHelper = (replay) => replay?.replay_id || replay?.sub_title;
+
+function CourseCard({ course, localCount, onUpdate, onOpenFolder, onOpenReplayCenter, lang }) {
     const [isEditing, setIsEditing] = useState(false);
     const [localAlias, setLocalAlias] = useState(course.alias || '');
 
@@ -85,14 +98,19 @@ function CourseCard({ course, localCount, onUpdate, onOpenFolder, lang }) {
             onClick={() => onUpdate(course.id, { ...course, skip: !course.skip })}
             className={clsx(
                 "group relative p-5 rounded-2xl border transition-[background-color,border-color,shadow,opacity,filter] duration-300 flex flex-col gap-4 cursor-pointer overflow-hidden",
-                course.skip 
-                ? "bg-slate-100 dark:bg-slate-900/40 border-slate-200 dark:border-slate-800/50 opacity-60 hover:opacity-80 grayscale-[0.3]" 
+                course.skip
+                ? "bg-slate-100 dark:bg-slate-900/40 border-slate-200 dark:border-slate-800/50 opacity-60 hover:opacity-80 grayscale-[0.3]"
+                : course.is_historical
+                ? "bg-amber-50/80 dark:bg-amber-900/10 border-amber-200 dark:border-amber-700/50 hover:border-amber-400/50 hover:shadow-lg hover:shadow-amber-400/10 backdrop-blur-sm"
                 : "bg-white/80 dark:bg-slate-800/40 border-slate-200 dark:border-slate-700/50 hover:border-neon-blue/50 hover:shadow-lg hover:shadow-neon-blue/10 backdrop-blur-sm"
             )}
         >
             {/* Background Gradient for Active State */}
-            {!course.skip && (
+            {!course.skip && !course.is_historical && (
                 <div className="absolute inset-0 bg-gradient-to-br from-neon-blue/5 to-neon-purple/5 opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none" />
+            )}
+            {!course.skip && course.is_historical && (
+                <div className="absolute inset-0 bg-gradient-to-br from-amber-500/5 to-orange-500/5 opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none" />
             )}
 
             <div className="flex justify-between items-start relative z-10">
@@ -101,10 +119,18 @@ function CourseCard({ course, localCount, onUpdate, onOpenFolder, lang }) {
                         "text-[10px] px-2 py-0.5 rounded-full font-mono border",
                         course.skip
                             ? "bg-slate-200 dark:bg-slate-800 text-slate-500 border-slate-300 dark:border-slate-700"
+                            : course.is_historical
+                            ? "bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-700"
                             : "bg-neon-blue/10 text-neon-blue border-neon-blue/20"
                     )}>
                         {course.id}
                     </div>
+                    {course.is_historical && (
+                        <div className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-700 flex items-center gap-1">
+                            <Archive className="w-3 h-3" />
+                            {t('historicalCourse', lang)}
+                        </div>
+                    )}
                     {localCount !== undefined && (
                         <div className="flex items-center gap-1 text-[10px] text-slate-400 bg-slate-100 dark:bg-slate-800/50 px-2 py-0.5 rounded-full border border-slate-200 dark:border-slate-700/50">
                             <FileText className="w-3 h-3" />
@@ -128,9 +154,24 @@ function CourseCard({ course, localCount, onUpdate, onOpenFolder, lang }) {
                             course.skip ? "text-slate-400" : "text-neon-blue"
                         )} />
                     </button>
+                    <button
+                        onClick={(e) => { e.stopPropagation(); onOpenReplayCenter(course.id); }}
+                        className={clsx(
+                            "p-1.5 rounded-lg transition-all opacity-0 group-hover:opacity-100",
+                            course.skip
+                                ? "hover:bg-slate-200 dark:hover:bg-slate-800"
+                                : "hover:bg-neon-purple/10"
+                        )}
+                        title={t('downloadReplays', lang)}
+                    >
+                        <Video className={clsx(
+                            "w-4 h-4",
+                            course.skip ? "text-slate-400" : "text-neon-purple"
+                        )} />
+                    </button>
                     <div className={clsx(
                         "w-2 h-2 rounded-full shadow-[0_0_8px_rgba(0,0,0,0.5)]",
-                        course.skip ? "bg-slate-400 dark:bg-slate-600" : "bg-green-400 shadow-green-400/50"
+                        course.skip ? "bg-slate-400 dark:bg-slate-600" : course.is_historical ? "bg-amber-400 shadow-amber-400/50" : "bg-green-400 shadow-green-400/50"
                     )} />
                 </div>
             </div>
@@ -190,14 +231,42 @@ function CourseCard({ course, localCount, onUpdate, onOpenFolder, lang }) {
                     </div>
                 </div>
             )}
+
         </motion.div>
     );
 }
 
+const dedupeCoursesHelper = (list) => {
+    const byId = new Map();
+    for (const course of (list || [])) {
+        const id = String(course?.id || '').trim();
+        if (!id) continue;
+        const existing = byId.get(id);
+        if (!existing) {
+            byId.set(id, course);
+            continue;
+        }
+        if (existing.is_historical && !course.is_historical) {
+            byId.set(id, course);
+            continue;
+        }
+        const existingScore = Number(Boolean(existing.url)) + (existing.available_tabs || []).length;
+        const currentScore = Number(Boolean(course.url)) + (course.available_tabs || []).length;
+        if (currentScore > existingScore) {
+            byId.set(id, course);
+        }
+    }
+    return [...byId.values()];
+};
+
 // Helper for consistent sorting
 const sortCoursesHelper = (list) => {
-    return [...list].sort((a, b) => {
-        // First sort by skip status (false/enabled first, true/disabled last)
+    return dedupeCoursesHelper(list).sort((a, b) => {
+        // First: historical courses after current courses
+        const aHist = a.is_historical ? 1 : 0;
+        const bHist = b.is_historical ? 1 : 0;
+        if (aHist !== bHist) return aHist - bHist;
+        // Then sort by skip status (false/enabled first, true/disabled last)
         if (a.skip === b.skip) return 0;
         return a.skip ? 1 : -1;
     });
@@ -309,6 +378,131 @@ function HelpModal({ onClose, lang }) {
     );
 }
 
+function ReplayModal({
+    course,
+    replays,
+    selectedKeys,
+    isLoading,
+    isDownloading,
+    onToggleReplay,
+    onSelectAll,
+    onClearAll,
+    onRefresh,
+    onDownload,
+    onClose,
+    lang,
+}) {
+    const selectedSet = new Set(selectedKeys || []);
+    const selectedCount = selectedSet.size;
+
+    const replayKey = (replay) => replay.replay_id || replay.sub_title;
+
+    return (
+        <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
+            onClick={onClose}
+        >
+            <motion.div
+                initial={{ scale: 0.95, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.95, opacity: 0 }}
+                className="bg-white dark:bg-slate-800 rounded-2xl shadow-2xl max-w-4xl w-full h-[80vh] border border-slate-200 dark:border-slate-700 flex flex-col overflow-hidden"
+                onClick={e => e.stopPropagation()}
+            >
+                <div className="p-4 border-b border-slate-200 dark:border-slate-700 flex items-center gap-3 bg-slate-50/50 dark:bg-slate-900/50">
+                    <Video className="w-5 h-5 text-neon-purple" />
+                    <div className="min-w-0">
+                        <div className="text-sm text-slate-500 dark:text-slate-400">{t('downloadReplays', lang)}</div>
+                        <div className="font-bold text-slate-900 dark:text-white truncate">{course?.name || ''}</div>
+                    </div>
+                    <button
+                        onClick={onRefresh}
+                        disabled={isLoading || isDownloading}
+                        className="ml-auto px-3 py-1.5 rounded-lg border border-neon-purple/30 text-neon-purple bg-neon-purple/10 hover:bg-neon-purple/20 disabled:opacity-60 text-sm"
+                    >
+                        <RefreshCw className={clsx("w-3.5 h-3.5 inline-block mr-1.5", isLoading && "animate-spin")} />
+                        {isLoading ? t('fetchingReplays', lang) : t('fetchReplayList', lang)}
+                    </button>
+                    <button onClick={onClose} className="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700">
+                        <X className="w-4 h-4 text-slate-500" />
+                    </button>
+                </div>
+
+                <div className="p-3 border-b border-slate-200 dark:border-slate-700 flex items-center gap-2 text-xs">
+                    <button onClick={onSelectAll} className="px-2.5 py-1 rounded border border-slate-300 dark:border-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700">
+                        {lang === 'zh' ? '全选' : 'Select All'}
+                    </button>
+                    <button onClick={onClearAll} className="px-2.5 py-1 rounded border border-slate-300 dark:border-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700">
+                        {lang === 'zh' ? '清空' : 'Clear'}
+                    </button>
+                    <span className="ml-auto text-slate-500 dark:text-slate-400">
+                        {selectedCount}/{replays.length} {lang === 'zh' ? '已选' : 'selected'}
+                    </span>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-3 space-y-2 bg-slate-50/30 dark:bg-slate-900/20">
+                    {replays.length === 0 ? (
+                        <div className="h-full flex items-center justify-center text-slate-500 dark:text-slate-400 text-sm">
+                            {isLoading ? t('fetchingReplays', lang) : t('noReplays', lang)}
+                        </div>
+                    ) : (
+                        replays.map((replay) => {
+                            const key = replayKey(replay);
+                            const checked = selectedSet.has(key);
+                            return (
+                                <button
+                                    key={key}
+                                    onClick={() => onToggleReplay(key)}
+                                    className={clsx(
+                                        "w-full text-left p-3 rounded-xl border transition-colors",
+                                        checked
+                                            ? "bg-neon-purple/10 border-neon-purple/40"
+                                            : "bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600"
+                                    )}
+                                >
+                                    <div className="flex items-center gap-3">
+                                        <div className={clsx(
+                                            "w-4 h-4 rounded border flex items-center justify-center",
+                                            checked ? "border-neon-purple bg-neon-purple text-white" : "border-slate-400"
+                                        )}>
+                                            {checked && <Check className="w-3 h-3" />}
+                                        </div>
+                                        <div className="min-w-0">
+                                            <div className="font-medium text-slate-900 dark:text-white truncate">{replay.sub_title}</div>
+                                            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                                                {replay.lecturer_name || '-'} · {replay.filename}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </button>
+                            );
+                        })
+                    )}
+                </div>
+
+                <div className="p-4 border-t border-slate-200 dark:border-slate-700 bg-white/90 dark:bg-slate-800/90 flex justify-end gap-2">
+                    <button
+                        onClick={onClose}
+                        className="px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-300"
+                    >
+                        {t('cancel', lang)}
+                    </button>
+                    <button
+                        onClick={onDownload}
+                        disabled={isDownloading || selectedCount === 0}
+                        className="px-4 py-2 rounded-lg bg-neon-purple text-white font-medium hover:bg-purple-600 disabled:opacity-60"
+                    >
+                        {isDownloading ? (lang === 'zh' ? '下载中...' : 'Downloading...') : (lang === 'zh' ? '下载选中回放' : 'Download Selected')}
+                    </button>
+                </div>
+            </motion.div>
+        </motion.div>
+    );
+}
+
 // Brand Footer Component - Shows project info with GitHub link
 function BrandFooter({ theme, showGithub = true, showAuthor = true }) {
     const brandName = theme === 'dark' ? 'PKU-Get' : '未名拾课';
@@ -316,7 +510,7 @@ function BrandFooter({ theme, showGithub = true, showAuthor = true }) {
     return (
         <div className="mt-6 text-center text-xs text-slate-400 dark:text-slate-500 space-y-2">
             <p className="font-semibold text-slate-600 dark:text-slate-300">
-                {brandName} v2.0.1
+                {brandName} v2.5
             </p>
             {showAuthor && (
                 <p>
@@ -326,12 +520,12 @@ function BrandFooter({ theme, showGithub = true, showAuthor = true }) {
                         <>
                             {' '}(
                             <a
-                                href="https://github.com/yourusername"
+                                href="https://github.com/robin0505"
                                 className="text-neon-blue hover:underline"
                                 target="_blank"
                                 rel="noopener noreferrer"
                             >
-                                @yourusername
+                                @robin0505
                             </a>
                             )
                         </>
@@ -340,7 +534,7 @@ function BrandFooter({ theme, showGithub = true, showAuthor = true }) {
             )}
             {showGithub && (
                 <a
-                    href="https://github.com/yourusername/PKU-Get"
+                    href="https://github.com/robin0505/PKU-Get"
                     className="inline-flex items-center gap-1 text-neon-blue hover:underline transition-colors"
                     target="_blank"
                     rel="noopener noreferrer"
@@ -368,6 +562,7 @@ function App() {
   const [courses, setCourses] = useState([]);
   const [logs, setLogs] = useState([]);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isRefreshingInfo, setIsRefreshingInfo] = useState(false);
   const [runtimeState, setRuntimeState] = useState({ last_sync: 'Never', total_files: 0 });
   const [localStats, setLocalStats] = useState({ total: 0, courses: {} });
   const [previousView, setPreviousView] = useState(null);
@@ -384,6 +579,12 @@ function App() {
   // Progress tracking state
   const [progressData, setProgressData] = useState(null);
   const [isProgressExpanded, setIsProgressExpanded] = useState(false); // 默认收起
+  const [isPaused, setIsPaused] = useState(false);
+  const [fetchingReplayId, setFetchingReplayId] = useState(null);
+  const [replayModalCourseId, setReplayModalCourseId] = useState(null);
+  const [replaySelectionByCourse, setReplaySelectionByCourse] = useState({});
+  const [replayDownloadingCourseId, setReplayDownloadingCourseId] = useState(null);
+  const [showHistorical, setShowHistorical] = useState(false);
 
   // Log resize state
   const [logHeight, setLogHeight] = useState(200);
@@ -397,6 +598,12 @@ function App() {
 
   // Convenience accessor for language
   const lang = config.language || 'zh';
+  const replayModalCourse = useMemo(
+      () => courses.find(c => c.id === replayModalCourseId) || null,
+      [courses, replayModalCourseId]
+  );
+  const replayModalReplays = replayModalCourse?.available_replays || [];
+  const replayModalSelected = replayModalCourseId ? (replaySelectionByCourse[replayModalCourseId] || []) : [];
 
   useEffect(() => {
     // Apply theme to document
@@ -413,17 +620,21 @@ function App() {
     window.setCourses = (data) => setCourses(sortCoursesHelper(data));
     window.updateProgress = (data) => {
       setProgressData(data);
-      // If downloading started, show progress (hide logs by default)
-      if (data.phase === 'downloading' && !isLogOpen) {
-        // Keep logs closed during sync
+      // Track paused state from backend
+      if (data.phase === 'paused') {
+        setIsPaused(true);
+      } else if (data.phase === 'downloading' || data.phase === 'scanning') {
+        setIsPaused(false);
       }
       // When complete, clear progress data
       if (data.phase === 'complete') {
+        setIsPaused(false);
         setTimeout(() => setProgressData(null), 2000); // Clear after 2s
       }
     };
     window.syncComplete = () => {
         setIsSyncing(false);
+        setIsPaused(false);
         setProgressData(null); // Clear progress on complete
         setView('dashboard');
         // Refresh stats after sync
@@ -458,8 +669,54 @@ function App() {
             console.error('Failed to load sync reports:', err);
         });
     };
+    window.replaysFetched = (courseId, replays, error) => {
+        setFetchingReplayId(null);
+        if (error) {
+            console.error('Failed to fetch replays:', error);
+            return;
+        }
+        if (replays) {
+            const seen = new Set();
+            const deduped = replays.filter((replay) => {
+                const key = replayKeyHelper(replay);
+                if (!key || seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
+
+            setCourses(prev => prev.map(c =>
+                c.id === courseId ? { ...c, available_replays: deduped } : c
+            ));
+            setReplaySelectionByCourse(prev => {
+                if (prev[courseId]) return prev;
+                return { ...prev, [courseId]: deduped.map(replayKeyHelper) };
+            });
+        }
+    };
+    window.replayDownloadFinished = (courseId, success, message) => {
+        setReplayDownloadingCourseId(null);
+        if (success) {
+            window.addLog?.(`[INFO] ${message || 'Replay download finished'}`);
+        } else {
+            window.addLog?.(`[ERROR] ${message || 'Replay download failed'}`);
+            alert(message || 'Replay download failed');
+        }
+    };
+    window.courseInfoRefreshed = (updatedCourses, error) => {
+        setIsRefreshingInfo(false);
+        if (error) {
+            window.addLog?.(`[ERROR] Refresh course info failed: ${error}`);
+            alert('Refresh failed: ' + error);
+            return;
+        }
+        if (updatedCourses && updatedCourses.length > 0) {
+            setCourses(sortCoursesHelper(updatedCourses));
+        }
+        window.addLog?.('[INFO] Course info refreshed successfully.');
+    };
     window.syncFailed = (err) => {
         setIsSyncing(false);
+        setIsPaused(false);
         setProgressData(null); // Clear progress on failure
         alert('Sync Failed: ' + err);
 
@@ -585,7 +842,7 @@ function App() {
   useEffect(() => {
     let intervalId;
 
-    if (progressData && progressData.phase === 'downloading') {
+    if (progressData && (progressData.phase === 'downloading' || progressData.phase === 'paused' || progressData.phase === 'scanning')) {
       // Update local stats every 3 seconds during download
       intervalId = setInterval(() => {
         getApi().get_init_state().then(data => {
@@ -665,6 +922,43 @@ function App() {
       }, 300);
   };
 
+  const handleFetchReplays = async (courseId) => {
+      setFetchingReplayId(courseId);
+      await getApi().fetch_replays(courseId);
+  };
+
+  const handleOpenReplayCenter = async (courseId) => {
+      setReplayModalCourseId(courseId);
+      const target = courses.find(c => c.id === courseId);
+      const hasList = target?.available_replays && target.available_replays.length > 0;
+      if (!hasList) {
+          await handleFetchReplays(courseId);
+      } else {
+          setReplaySelectionByCourse(prev => {
+              if (prev[courseId]) return prev;
+              return { ...prev, [courseId]: target.available_replays.map(replayKeyHelper) };
+          });
+      }
+  };
+
+  const handleToggleReplaySelection = (courseId, replayKey) => {
+      setReplaySelectionByCourse(prev => {
+          const current = new Set(prev[courseId] || []);
+          if (current.has(replayKey)) current.delete(replayKey);
+          else current.add(replayKey);
+          return { ...prev, [courseId]: [...current] };
+      });
+  };
+
+  const handleDownloadReplaysDirect = async () => {
+      if (!replayModalCourseId) return;
+      const selected = replaySelectionByCourse[replayModalCourseId] || [];
+      if (selected.length === 0) return;
+
+      setReplayDownloadingCourseId(replayModalCourseId);
+      await getApi().download_replays_direct(replayModalCourseId, selected);
+  };
+
   const handleSaveSettings = async (e) => {
       e.preventDefault();
       // Save immediately and go back
@@ -681,6 +975,22 @@ function App() {
 
     setIsSyncing(true);
     await getApi().sync_downloads();
+  };
+
+  const handleRefreshCourseInfo = async () => {
+    if (isRefreshingInfo || isSyncing) return;
+    setIsRefreshingInfo(true);
+    await getApi().refresh_course_info();
+  };
+
+  const handlePauseSync = async () => {
+    const result = await getApi().pause_sync();
+    setIsPaused(result.paused);
+  };
+
+  const handleStopSync = async () => {
+    await getApi().stop_sync();
+    // syncComplete() will be called by backend naturally when download finishes
   };
 
   const handleUpdateCourse = async (courseId, newConfig) => {
@@ -738,7 +1048,9 @@ function App() {
                   headless: config.headless,
                   concurrent_downloads: config.concurrent_downloads,
                   auto_sync: false,
-                  language: config.language
+                  language: config.language,
+                  show_history_toggle: config.show_history_toggle,
+                  include_history: config.include_history,
               });
               setRuntimeState({ last_sync: 'Never', total_files: 0 });
               // 跳转到登录页
@@ -844,6 +1156,27 @@ const selectFolder = async () => {
     <div className="h-screen overflow-hidden bg-slate-50 dark:bg-[#0B1120] text-slate-900 dark:text-white flex flex-col font-sans selection:bg-neon-blue selection:text-white relative transition-colors duration-300">
       <AnimatePresence>
         {showHelp && <HelpModal onClose={() => setShowHelp(false)} lang={lang} />}
+      </AnimatePresence>
+      <AnimatePresence>
+        {replayModalCourse && (
+            <ReplayModal
+                course={replayModalCourse}
+                replays={replayModalReplays}
+                selectedKeys={replayModalSelected}
+                isLoading={fetchingReplayId === replayModalCourse.id}
+                isDownloading={replayDownloadingCourseId === replayModalCourse.id}
+                onToggleReplay={(key) => handleToggleReplaySelection(replayModalCourse.id, key)}
+                onSelectAll={() => setReplaySelectionByCourse(prev => ({
+                    ...prev,
+                    [replayModalCourse.id]: replayModalReplays.map(replayKeyHelper),
+                }))}
+                onClearAll={() => setReplaySelectionByCourse(prev => ({ ...prev, [replayModalCourse.id]: [] }))}
+                onRefresh={() => handleFetchReplays(replayModalCourse.id)}
+                onDownload={handleDownloadReplaysDirect}
+                onClose={() => setReplayModalCourseId(null)}
+                lang={lang}
+            />
+        )}
       </AnimatePresence>
       {/* Ambient Background Effects */}
       <div className="absolute top-0 left-0 w-full h-full overflow-hidden pointer-events-none z-0">
@@ -1121,6 +1454,15 @@ const selectFolder = async () => {
                         <Settings className="w-4 h-4" />
                         {t('settings', lang)}
                     </button>
+                    <button
+                        onClick={handleRefreshCourseInfo}
+                        disabled={isRefreshingInfo || isSyncing}
+                        title={t('refreshCourseInfoTooltip', lang)}
+                        className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-all shadow-sm disabled:opacity-50"
+                    >
+                        <RefreshCw className={clsx("w-4 h-4 text-neon-purple", isRefreshingInfo && "animate-spin")} />
+                        {isRefreshingInfo ? t('refreshingCourseInfo', lang) : t('refreshCourseInfo', lang)}
+                    </button>
                     <button 
                         onClick={handleSync}
                         disabled={isSyncing}
@@ -1132,27 +1474,95 @@ const selectFolder = async () => {
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pb-20">
-                  {courses.length === 0 ? (
-                      <div className="col-span-full text-center py-20 text-slate-400 dark:text-slate-500">
-                          <p className="text-xl">{t('noCoursesSelected', lang)}</p>
-                          <p className="text-sm mt-2">{t('syncNow', lang)}</p>
+              {(() => {
+                  const currentCourses = courses.filter(c => !c.is_historical);
+                  const historicalCourses = courses.filter(c => c.is_historical);
+                  const hasHistorical = historicalCourses.length > 0;
+
+                  return (
+                    <>
+                      {/* Current Courses */}
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                          {currentCourses.length === 0 && !hasHistorical ? (
+                              <div className="col-span-full text-center py-20 text-slate-400 dark:text-slate-500">
+                                  <p className="text-xl">{t('noCoursesSelected', lang)}</p>
+                                  <p className="text-sm mt-2">{t('syncNow', lang)}</p>
+                              </div>
+                          ) : (
+                            <AnimatePresence mode="popLayout">
+                                {currentCourses.map(course => (
+                                <CourseCard
+                                    key={course.id}
+                                    course={course}
+                                    localCount={localStats.courses[course.name] || localStats.courses[course.alias]}
+                                    onUpdate={handleUpdateCourse}
+                                    onOpenFolder={handleOpenFolder}
+                                    onOpenReplayCenter={handleOpenReplayCenter}
+                                    lang={lang}
+                                />
+                                ))}
+                            </AnimatePresence>
+                          )}
                       </div>
-                  ) : (
-                    <AnimatePresence mode="popLayout">
-                        {courses.map(course => (
-                        <CourseCard
-                            key={course.id}
-                            course={course}
-                            localCount={localStats.courses[course.name] || localStats.courses[course.alias]}
-                            onUpdate={handleUpdateCourse}
-                            onOpenFolder={handleOpenFolder}
-                            lang={lang}
-                        />
-                        ))}
-                    </AnimatePresence>
-                  )}
-              </div>
+
+                      {/* Historical Courses Section */}
+                      {hasHistorical && (
+                          <div className="mt-8 pb-20">
+                              <button
+                                  onClick={() => setShowHistorical(!showHistorical)}
+                                  className="w-full flex items-center gap-3 mb-4 group"
+                              >
+                                  <div className="flex items-center gap-2">
+                                      <Archive className="w-5 h-5 text-amber-500" />
+                                      <h3 className="text-lg font-bold text-amber-600 dark:text-amber-400">
+                                          {t('historicalCoursesSection', lang)}
+                                      </h3>
+                                      <span className="text-sm text-amber-500/70 font-mono">
+                                          ({historicalCourses.length})
+                                      </span>
+                                  </div>
+                                  <div className="flex-1 h-px bg-amber-200 dark:bg-amber-800/50" />
+                                  <ChevronDown className={clsx(
+                                      "w-5 h-5 text-amber-500 transition-transform duration-300",
+                                      showHistorical && "rotate-180"
+                                  )} />
+                              </button>
+
+                              <AnimatePresence>
+                                  {showHistorical && (
+                                      <motion.div
+                                          initial={{ opacity: 0, height: 0 }}
+                                          animate={{ opacity: 1, height: 'auto' }}
+                                          exit={{ opacity: 0, height: 0 }}
+                                          transition={{ duration: 0.3 }}
+                                          className="overflow-hidden"
+                                      >
+                                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                              <AnimatePresence mode="popLayout">
+                                                  {historicalCourses.map(course => (
+                                                      <CourseCard
+                                                          key={course.id}
+                                                          course={course}
+                                                          localCount={localStats.courses[course.name] || localStats.courses[course.alias]}
+                                                          onUpdate={handleUpdateCourse}
+                                                          onOpenFolder={handleOpenFolder}
+                                                          onOpenReplayCenter={handleOpenReplayCenter}
+                                                          lang={lang}
+                                                      />
+                                                  ))}
+                                              </AnimatePresence>
+                                          </div>
+                                      </motion.div>
+                                  )}
+                              </AnimatePresence>
+                          </div>
+                      )}
+
+                      {/* Bottom padding when no historical */}
+                      {!hasHistorical && <div className="pb-20" />}
+                    </>
+                  );
+              })()}
             </motion.div>
           )}
 
@@ -1312,6 +1722,49 @@ const selectFolder = async () => {
                                   onChange={e => handleConfigChange({...config, auto_sync: e.target.checked})}
                               />
                           </label>
+
+                          {/* Historical Courses Toggle */}
+                          <label className="flex items-center justify-between p-3 rounded-lg border border-amber-200 dark:border-amber-800/50 hover:border-amber-400 dark:hover:border-amber-600 transition-colors cursor-pointer group">
+                              <div className="flex items-center gap-3">
+                                  <div className={clsx("w-4 h-4 rounded border flex items-center justify-center transition-colors", config.show_history_toggle ? "bg-amber-500 border-amber-500" : "border-slate-400 dark:border-slate-600")}>
+                                      {config.show_history_toggle && <Check className="w-3 h-3 text-white" />}
+                                  </div>
+                                  <div>
+                                      <div className="text-sm font-medium text-slate-900 dark:text-white flex items-center gap-2">
+                                          <Archive className="w-3.5 h-3.5 text-amber-500" />
+                                          {t('showHistoryToggle', lang)}
+                                      </div>
+                                      <div className="text-xs text-slate-500 dark:text-slate-400">{t('showHistoryToggleDesc', lang)}</div>
+                                  </div>
+                              </div>
+                              <input
+                                  type="checkbox"
+                                  className="hidden"
+                                  checked={config.show_history_toggle || false}
+                                  onChange={e => handleConfigChange({...config, show_history_toggle: e.target.checked, ...(!e.target.checked && { include_history: false })})}
+                              />
+                          </label>
+
+                          {/* Include Historical Courses (nested, only visible when show_history_toggle is on) */}
+                          {config.show_history_toggle && (
+                              <label className="flex items-center justify-between p-3 ml-6 rounded-lg border border-amber-200/60 dark:border-amber-800/30 hover:border-amber-400 dark:hover:border-amber-600 transition-colors cursor-pointer group bg-amber-50/50 dark:bg-amber-900/10">
+                                  <div className="flex items-center gap-3">
+                                      <div className={clsx("w-4 h-4 rounded border flex items-center justify-center transition-colors", config.include_history ? "bg-amber-500 border-amber-500" : "border-slate-400 dark:border-slate-600")}>
+                                          {config.include_history && <Check className="w-3 h-3 text-white" />}
+                                      </div>
+                                      <div>
+                                          <div className="text-sm font-medium text-slate-900 dark:text-white">{t('includeHistory', lang)}</div>
+                                          <div className="text-xs text-slate-500 dark:text-slate-400">{t('includeHistoryDesc', lang)}</div>
+                                      </div>
+                                  </div>
+                                  <input
+                                      type="checkbox"
+                                      className="hidden"
+                                      checked={config.include_history || false}
+                                      onChange={e => handleConfigChange({...config, include_history: e.target.checked})}
+                                  />
+                              </label>
+                          )}
                       </div>
                   </div>
 
@@ -1655,9 +2108,11 @@ const selectFolder = async () => {
                             "px-3 py-1 rounded-full text-xs font-bold",
                             report.status === 'success'
                               ? "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400"
+                              : report.status === 'stopped'
+                              ? "bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
                               : "bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400"
                           )}>
-                            {report.status}
+                            {report.status === 'stopped' ? t('stopped', lang) : report.status}
                           </div>
                         </div>
 
@@ -1693,7 +2148,7 @@ const selectFolder = async () => {
 
       {/* Bottom Progress Bar */}
       <AnimatePresence>
-        {progressData && progressData.phase === 'downloading' && isProgressExpanded && (
+        {progressData && (progressData.phase === 'downloading' || progressData.phase === 'paused' || progressData.phase === 'scanning') && isProgressExpanded && (
           <motion.div
             initial={{ y: 100 }}
             animate={{ y: 0 }}
@@ -1730,25 +2185,69 @@ const selectFolder = async () => {
                 <div className="flex justify-between items-center mb-3">
                   <div className="flex-1">
                     <div className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-neon-blue to-neon-purple flex items-center justify-center shadow-lg">
-                        <Download className="w-4 h-4 text-white animate-bounce" />
+                      <div className={clsx(
+                        "w-8 h-8 rounded-full flex items-center justify-center shadow-lg",
+                        isPaused
+                          ? "bg-gradient-to-br from-amber-400 to-amber-600"
+                          : "bg-gradient-to-br from-neon-blue to-neon-purple"
+                      )}>
+                        {isPaused
+                          ? <Pause className="w-4 h-4 text-white" />
+                          : progressData.phase === 'scanning'
+                            ? <Search className="w-4 h-4 text-white animate-pulse" />
+                            : <Download className="w-4 h-4 text-white animate-bounce" />
+                        }
                       </div>
-                      {t('syncingCourse', lang)} {progressData.current_course_name}
+                      {isPaused ? t('paused', lang) + ':' : progressData.phase === 'scanning' ? t('scanningCourse', lang) : t('syncingCourse', lang)} {progressData.current_course_name}
                       <span className="text-xs font-normal text-slate-500 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-full">
                         {t('course', lang)} {progressData.current_course_index}/{progressData.total_courses}
                       </span>
                     </div>
                     <div className="text-xs text-slate-600 dark:text-slate-400 mt-2 ml-10 flex items-center gap-2">
-                      <span className="truncate max-w-md">{t('currentFile', lang)} {progressData.current_file_name}</span>
-                      {progressData.current_file_size > 0 && (
+                      <span className="truncate max-w-md">{progressData.phase === 'scanning' ? t('scanningFiles', lang) : <>{t('currentFile', lang)} {progressData.current_file_name}</>}</span>
+                      {progressData.phase !== 'scanning' && (progressData.bytes_expected > 0 || progressData.bytes_downloaded > 0) && (
                         <span className="text-slate-500 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded">
-                          {(progressData.current_file_downloaded / 1024 / 1024).toFixed(1)} / {(progressData.current_file_size / 1024 / 1024).toFixed(1)} MB
+                          {progressData.bytes_expected > 0 && progressData.bytes_downloaded <= progressData.bytes_expected
+                            ? `${(progressData.bytes_downloaded / 1024 / 1024).toFixed(1)} / ${(progressData.bytes_expected / 1024 / 1024).toFixed(1)} MB`
+                            : `${(progressData.bytes_downloaded / 1024 / 1024).toFixed(1)} MB`}
                         </span>
                       )}
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-4">
+                  <div className="flex items-center gap-3">
+                    {/* Paused badge */}
+                    {isPaused && (
+                      <span className="text-xs font-bold text-amber-600 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/30 px-3 py-1.5 rounded-xl border border-amber-200 dark:border-amber-800 animate-pulse">
+                        {t('paused', lang)}
+                      </span>
+                    )}
+
+                    {/* Pause/Resume button */}
+                    <button
+                      onClick={handlePauseSync}
+                      className={clsx(
+                        "px-3 py-2 text-xs rounded-xl transition-all flex items-center gap-2 border shadow-sm hover:shadow-md font-medium",
+                        isPaused
+                          ? "bg-green-50 dark:bg-green-900/30 hover:bg-green-100 dark:hover:bg-green-900/50 text-green-600 dark:text-green-400 border-green-200 dark:border-green-800"
+                          : "bg-amber-50 dark:bg-amber-900/30 hover:bg-amber-100 dark:hover:bg-amber-900/50 text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-800"
+                      )}
+                    >
+                      {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
+                      {isPaused ? t('resume', lang) : t('pause', lang)}
+                    </button>
+
+                    {/* Stop button */}
+                    <button
+                      onClick={handleStopSync}
+                      className="px-3 py-2 text-xs bg-red-50 dark:bg-red-900/30 hover:bg-red-100 dark:hover:bg-red-900/50 text-red-600 dark:text-red-400 rounded-xl transition-all flex items-center gap-2 border border-red-200 dark:border-red-800 shadow-sm hover:shadow-md font-medium"
+                    >
+                      <Square className="w-3.5 h-3.5" />
+                      {t('stop', lang)}
+                    </button>
+
+                    <div className="w-px h-6 bg-slate-300 dark:bg-slate-600" />
+
                     <div className="flex items-center gap-3 text-xs bg-slate-50 dark:bg-slate-800/50 px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700">
                       <span className="flex items-center gap-1 text-green-600 dark:text-green-400 font-bold">
                         <Check className="w-3 h-3" />
@@ -1790,22 +2289,35 @@ const selectFolder = async () => {
                   <div className="flex justify-between text-xs mb-2 text-slate-600 dark:text-slate-400 font-medium">
                     <span>{t('courseProgress', lang)}</span>
                     <span className="font-mono">
-                      {progressData.course_files_total > 0
-                        ? `${Math.round((progressData.course_files_done / progressData.course_files_total) * 100)}%`
-                        : '0%'
-                      } ({progressData.course_files_done}/{progressData.course_files_total})
+                      {progressData.phase === 'scanning'
+                        ? t('scanningFiles', lang)
+                        : <>
+                            {progressData.course_files_total > 0
+                              ? `${Math.round((progressData.course_files_done / progressData.course_files_total) * 100)}%`
+                              : '0%'
+                            } ({progressData.course_files_done}/{progressData.course_files_total})
+                          </>
+                      }
                     </span>
                   </div>
                   <div className="h-3 bg-slate-200 dark:bg-slate-900 rounded-full overflow-hidden shadow-inner">
-                    <div
-                      className="h-full bg-gradient-to-r from-neon-blue to-blue-500 shadow-lg relative overflow-hidden transition-all duration-100 ease-out"
-                      style={{
-                        width: `${progressData.course_files_total > 0 ? (progressData.course_files_done / progressData.course_files_total) * 100 : 0}%`
-                      }}
-                    >
-                      {/* 降低高亮透明度 via-white/15 */}
-                      <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/15 to-transparent animate-shimmer" />
-                    </div>
+                    {progressData.phase === 'scanning' ? (
+                      <div
+                        className="h-full w-1/3 bg-gradient-to-r from-neon-blue to-blue-500 shadow-lg relative overflow-hidden animate-indeterminate"
+                      >
+                        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/15 to-transparent animate-shimmer" />
+                      </div>
+                    ) : (
+                      <div
+                        className="h-full bg-gradient-to-r from-neon-blue to-blue-500 shadow-lg relative overflow-hidden transition-all duration-100 ease-out"
+                        style={{
+                          width: `${progressData.course_files_total > 0 ? (progressData.course_files_done / progressData.course_files_total) * 100 : 0}%`
+                        }}
+                      >
+                        {/* 降低高亮透明度 via-white/15 */}
+                        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/15 to-transparent animate-shimmer" />
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1816,7 +2328,7 @@ const selectFolder = async () => {
 
       {/* Mini Progress Indicator (Bottom Right) */}
       <AnimatePresence>
-        {progressData && progressData.phase === 'downloading' && !isProgressExpanded && (
+        {progressData && (progressData.phase === 'downloading' || progressData.phase === 'paused' || progressData.phase === 'scanning') && !isProgressExpanded && (
           <motion.div
             initial={{ scale: 0, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
@@ -1857,7 +2369,12 @@ const selectFolder = async () => {
                   </defs>
                 </svg>
                 <div className="absolute inset-0 flex items-center justify-center">
-                  <Download className="w-5 h-5 text-neon-blue animate-pulse" />
+                  {isPaused
+                    ? <Pause className="w-5 h-5 text-amber-500" />
+                    : progressData.phase === 'scanning'
+                      ? <Search className="w-5 h-5 text-neon-blue animate-pulse" />
+                      : <Download className="w-5 h-5 text-neon-blue animate-pulse" />
+                  }
                 </div>
               </div>
 
@@ -1876,24 +2393,55 @@ const selectFolder = async () => {
               <div className="flex justify-between text-xs mb-1 text-slate-600 dark:text-slate-400">
                 <span>{t('courseProgress', lang)}</span>
                 <span>
-                  {progressData.course_files_total > 0
-                    ? `${Math.round((progressData.course_files_done / progressData.course_files_total) * 100)}%`
-                    : '0%'
+                  {progressData.phase === 'scanning'
+                    ? t('scanningFiles', lang)
+                    : progressData.course_files_total > 0
+                      ? `${Math.round((progressData.course_files_done / progressData.course_files_total) * 100)}%`
+                      : '0%'
                   }
                 </span>
               </div>
               <div className="h-1.5 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-gradient-to-r from-neon-blue to-neon-purple transition-all duration-100 ease-out"
-                  style={{
-                    width: `${progressData.course_files_total > 0 ? (progressData.course_files_done / progressData.course_files_total) * 100 : 0}%`
-                  }}
-                />
+                {progressData.phase === 'scanning' ? (
+                  <div
+                    className="h-full w-1/3 bg-gradient-to-r from-neon-blue to-neon-purple animate-indeterminate"
+                  />
+                ) : (
+                  <div
+                    className="h-full bg-gradient-to-r from-neon-blue to-neon-purple transition-all duration-100 ease-out"
+                    style={{
+                      width: `${progressData.course_files_total > 0 ? (progressData.course_files_done / progressData.course_files_total) * 100 : 0}%`
+                    }}
+                  />
+                )}
               </div>
             </div>
 
+            {/* Controls */}
+            <div className="flex items-center gap-2 border-t border-slate-200 dark:border-slate-700 pt-2 mb-2">
+              <button
+                onClick={(e) => { e.stopPropagation(); handlePauseSync(); }}
+                className={clsx(
+                  "flex-1 py-1.5 text-xs rounded-lg transition-all flex items-center justify-center gap-1 font-medium border",
+                  isPaused
+                    ? "bg-green-50 dark:bg-green-900/30 text-green-600 dark:text-green-400 border-green-200 dark:border-green-800"
+                    : "bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-800"
+                )}
+              >
+                {isPaused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
+                {isPaused ? t('resume', lang) : t('pause', lang)}
+              </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); handleStopSync(); }}
+                className="flex-1 py-1.5 text-xs bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded-lg transition-all flex items-center justify-center gap-1 font-medium border border-red-200 dark:border-red-800"
+              >
+                <Square className="w-3 h-3" />
+                {t('stop', lang)}
+              </button>
+            </div>
+
             {/* Stats */}
-            <div className="flex items-center gap-3 text-xs border-t border-slate-200 dark:border-slate-700 pt-2">
+            <div className="flex items-center gap-3 text-xs">
               <span className="flex items-center gap-1 text-green-600 dark:text-green-400">
                 <Check className="w-3 h-3" />
                 {progressData.stats.downloaded}
@@ -1906,7 +2454,12 @@ const selectFolder = async () => {
                 <X className="w-3 h-3" />
                 {progressData.stats.failed}
               </span>
-              <span className="ml-auto text-xs text-slate-400">{t('clickToExpand', lang)}</span>
+              {isPaused && (
+                <span className="ml-auto text-xs font-bold text-amber-500 animate-pulse">{t('paused', lang)}</span>
+              )}
+              {!isPaused && (
+                <span className="ml-auto text-xs text-slate-400">{t('clickToExpand', lang)}</span>
+              )}
             </div>
           </motion.div>
         )}

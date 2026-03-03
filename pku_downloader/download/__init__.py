@@ -5,20 +5,27 @@ No BS, just download files efficiently.
 import re
 import time
 import json
+import base64
+import threading
 import requests
 import mimetypes
 import traceback
 from collections import namedtuple
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin, unquote, urlparse, parse_qs
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+import os
+
 from ..logger import get_logger
 
 logger = get_logger('download')
+
+# Set PKU_REPLAY_DEBUG=1 in your environment to enable verbose replay detection logging.
+REPLAY_DEBUG: bool = os.environ.get('PKU_REPLAY_DEBUG', '').lower() in ('1', 'true', 'yes')
 
 
 class Downloader:
@@ -122,6 +129,44 @@ class Downloader:
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _decode_jwt_payload(token: str) -> Optional[Dict]:
+        """Decode JWT payload without signature verification."""
+        try:
+            parts = token.split('.')
+            if len(parts) < 2:
+                return None
+            payload_b64 = parts[1]
+            payload_b64 += '=' * (-len(payload_b64) % 4)
+            payload = base64.urlsafe_b64decode(payload_b64.encode('utf-8'))
+            return json.loads(payload.decode('utf-8'))
+        except Exception:
+            return None
+
+    def _extract_hqy_course_id_from_playvideo_href(self, href: str) -> Optional[str]:
+        """Extract hqyCourseId from playVideo.action JWT token URL."""
+        try:
+            parsed = urlparse(href)
+            query = parse_qs(parsed.query)
+            token_values = query.get('token', [])
+            if not token_values:
+                match = re.search(r'token=([^&]+)', href)
+                if not match:
+                    return None
+                token_values = [match.group(1)]
+
+            token = unquote(token_values[0])
+            payload = self._decode_jwt_payload(token)
+            if not payload:
+                return None
+
+            hqy_course_id = payload.get('hqyCourseId')
+            if hqy_course_id is None:
+                return None
+            return str(hqy_course_id)
+        except Exception:
+            return None
     
     def __init__(self, session: requests.Session, config):
         self.session = session
@@ -145,6 +190,11 @@ class Downloader:
         self.reports_dir = config_dir / 'reports'
         self.reports_dir.mkdir(parents=True, exist_ok=True)
 
+        # Stop/Pause control
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # Start in running state (set = not paused)
+
         # Progress tracking
         self.progress = {
             'phase': 'idle',
@@ -156,50 +206,42 @@ class Downloader:
             'current_file_name': '',
             'current_file_progress': 0.0,
             'current_file_size': 0,
-            'current_file_downloaded': 0
+            'current_file_downloaded': 0,
+            'bytes_downloaded': 0,   # cumulative bytes written this course batch
+            'bytes_expected': 0      # cumulative bytes expected this course batch
         }
+        self._progress_lock = threading.Lock()
         self.last_progress_update = 0
         self.window = None  # Will be set by gui.py
+
+    def _parse_tabs_from_soup(self, soup: BeautifulSoup, base_url: str, course: Dict) -> List[Dict]:
+        """Extract course navigation tabs from an already-fetched BeautifulSoup object."""
+        menu = soup.find('ul', id='courseMenuPalette_contents')
+        if not menu:
+            return []
+        areas = []
+        for link in menu.find_all('a'):
+            name = link.text.strip()
+            url = link.get('href')
+            if not url or url.startswith('#') or url.startswith('javascript:'):
+                continue
+            areas.append({
+                'name': name,
+                'url': urljoin(base_url, url),
+                'flatten': course.get('flatten', True)
+            })
+        return areas
 
     def get_course_tabs(self, course: Dict) -> List[Dict]:
         """Fetch available tabs for a single course without downloading content."""
         course_url = course.get('url')
         if not course_url:
             return []
-
         try:
             response = self.session.get(course_url, timeout=20)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
-
-            menu = soup.find('ul', id='courseMenuPalette_contents')
-            if not menu:
-                return []
-
-            # Use _find_content_areas but force download_all=True to get EVERYTHING
-            # We want to discover all possibilities, not just what's configured
-            original_config_val = self.config.config.get('DEFAULT', 'download_all_areas', fallback='false')
-
-            # Temporarily mock config to get all areas
-            # Note: This is a bit hacky but avoids rewriting _find_content_areas signature
-            # A cleaner way would be to pass a flag to _find_content_areas
-            areas = []
-            for link in menu.find_all('a'):
-                name = link.text.strip()
-                url = link.get('href')
-
-                if not url or url.startswith('#') or url.startswith('javascript:'):
-                    continue
-
-                # We only care about content areas usually
-                # But let's just grab everything that looks like a content link
-                areas.append({
-                    'name': name,
-                    'url': urljoin(response.url, url),
-                    'flatten': course.get('flatten', True)
-                })
-            return areas
-
+            return self._parse_tabs_from_soup(soup, response.url, course)
         except Exception as e:
             logger.error(f"Failed to fetch tabs for {course.get('name')}: {e}")
             return []
@@ -224,25 +266,196 @@ class Downloader:
             except Exception as e:
                 logger.debug(f"Failed to emit progress: {e}")
 
-    def fetch_metadata(self, courses: List[Dict]) -> List[Dict]:
+    def _increment_files_done(self):
+        """Thread-safe increment of course_files_done."""
+        with self._progress_lock:
+            self.progress['course_files_done'] += 1
+
+    def stop(self):
+        """Request download stop."""
+        self._stop_event.set()
+        self._pause_event.set()  # Unpause to let threads exit
+
+    def pause(self):
+        """Pause the download."""
+        self._pause_event.clear()
+        self.progress['phase'] = 'paused'
+        self._emit_progress()
+
+    def resume(self):
+        """Resume the download."""
+        self._pause_event.set()
+        self.progress['phase'] = 'downloading'
+        self._emit_progress()
+
+    @property
+    def is_paused(self):
+        return not self._pause_event.is_set()
+
+    @property
+    def is_stopped(self):
+        return self._stop_event.is_set()
+
+    def _check_stop(self):
+        """Check if stop requested. Blocks while paused. Returns True if should stop."""
+        if self._stop_event.is_set():
+            return True
+        self._pause_event.wait()  # Blocks if paused
+        return self._stop_event.is_set()
+
+    def _discover_replay_id_from_soup(self, soup: BeautifulSoup, base_url: str, course: Dict) -> Optional[str]:
+        """Discover replay course_id from an already-fetched course page soup.
+        Returns the replay course_id string or None.
+        Set PKU_REPLAY_DEBUG=1 for verbose per-link logging."""
+        menu = soup.find('ul', id='courseMenuPalette_contents')
+        if not menu:
+            logger.debug(f"  [replay] No courseMenuPalette_contents found for {course.get('name')}")
+            return None
+
+        if REPLAY_DEBUG:
+            all_links = [f"    '{link.text.strip()}' -> {link.get('href', '')}" for link in menu.find_all('a')]
+            logger.info(f"  [replay] Menu links for {course.get('name')}:\n" + "\n".join(all_links))
+
+        for link in menu.find_all('a'):
+            href = link.get('href', '')
+            text = link.text.strip()
+
+            href_match = any(kw in href for kw in ['playVideo', 'bb-streammedia', 'streammedia'])
+            text_match = any(kw in text for kw in ['录播', '回放', '视频', '课堂实录', '在线课堂'])
+
+            if href_match or text_match:
+                full_url = urljoin(base_url, href)
+                if REPLAY_DEBUG:
+                    logger.info(f"  [replay] Following potential replay link: '{text}' -> {full_url}")
+                try:
+                    video_page = self.session.get(full_url, timeout=20)
+                    video_soup = BeautifulSoup(video_page.text, 'html.parser')
+
+                    if REPLAY_DEBUG:
+                        title_tag = video_soup.find('title')
+                        logger.info(f"  [replay] Page title: {title_tag.text.strip() if title_tag else 'N/A'}")
+                        for dbg_iframe in video_soup.find_all('iframe'):
+                            logger.info(f"  [replay] iframe src: {dbg_iframe.get('src', '')}")
+
+                    # Preferred path: onlineroomse player contains explicit course_id.
+                    iframe = video_soup.find('iframe', src=re.compile(r'onlineroomse\.pku\.edu\.cn'))
+                    if iframe:
+                        src = iframe['src']
+                        match = re.search(r'course_id=(\d+)', src)
+                        if match:
+                            logger.info(f"  [replay] Found replay for {course.get('name')}: course_id={match.group(1)}")
+                            return match.group(1)
+
+                    # Also check for onlineroomse links in <a> tags
+                    for a_tag in video_soup.find_all('a', href=re.compile(r'onlineroomse\.pku\.edu\.cn')):
+                        href_inner = a_tag.get('href', '')
+                        match = re.search(r'course_id=(\d+)', href_inner)
+                        if match:
+                            logger.info(f"  [replay] Found replay link in <a>: course_id={match.group(1)}")
+                            return match.group(1)
+
+                    # Check page text/scripts for onlineroomse URLs
+                    page_text = video_page.text
+                    matches = re.findall(r'onlineroomse\.pku\.edu\.cn[^"\'>\s]*course_id=(\d+)', page_text)
+                    if matches:
+                        logger.info(f"  [replay] Found replay in page source: course_id={matches[0]}")
+                        return matches[0]
+
+                    # Fallback path: streammedia "观看" links carry JWT token with hqyCourseId.
+                    for a_tag in video_soup.find_all('a'):
+                        href_inner = a_tag.get('href', '')
+                        if 'playVideo.action' not in href_inner or 'token=' not in href_inner:
+                            continue
+                        hqy_course_id = self._extract_hqy_course_id_from_playvideo_href(href_inner)
+                        if hqy_course_id:
+                            logger.info(
+                                f"  [replay] Found replay via playVideo token for "
+                                f"{course.get('name')}: hqyCourseId={hqy_course_id}"
+                            )
+                            return hqy_course_id
+
+                    token_pattern = r'playVideo\.action\?[^"\'>\s]*token=([A-Za-z0-9._%\-]+)'
+                    for token_encoded in re.findall(token_pattern, page_text):
+                        payload = self._decode_jwt_payload(unquote(token_encoded))
+                        hqy_course_id = payload.get('hqyCourseId') if payload else None
+                        if hqy_course_id is not None:
+                            logger.info(
+                                f"  [replay] Found replay via token in page source for "
+                                f"{course.get('name')}: hqyCourseId={hqy_course_id}"
+                            )
+                            return str(hqy_course_id)
+
+                    logger.debug(f"  [replay] No replay course_id/hqyCourseId found on this page")
+
+                except Exception as e:
+                    logger.debug(f"  [replay] Error following replay link: {e}")
+                    continue
+
+        return None
+
+    def discover_replay_id(self, course: Dict) -> Optional[str]:
+        """Check if a course has replay videos. Returns the replay course_id or None."""
+        course_url = course.get('url')
+        if not course_url:
+            return None
+        try:
+            response = self.session.get(course_url, timeout=20)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            return self._discover_replay_id_from_soup(soup, response.url, course)
+        except Exception as e:
+            logger.error(f"Failed to discover replay for {course.get('name')}: {e}")
+            return None
+
+    def fetch_metadata(self, courses: List[Dict], skip_if_cached: bool = False) -> List[Dict]:
         """
-        Parallel fetch of tabs for all courses.
-        Returns the courses list enriched with a 'tabs' key.
+        Parallel fetch of metadata (tabs + replay info) for all courses.
+        Each course page is fetched only once – tab discovery and replay detection
+        share the same HTTP response, halving the number of outbound requests.
+
+        If skip_if_cached=True, courses that already have 'available_tabs' populated
+        are returned as-is with no network request at all.
         """
         logger.info("Fetching course metadata...")
-        
+
         def _enrich_course(course):
-            # Return a new dict to avoid modifying the original in place if that matters,
-            # but here we just modify and return.
-            # We need to clone it to avoid race conditions if any
             c_copy = course.copy()
-            c_copy['tabs'] = self.get_course_tabs(c_copy)
-            # Extract just the names for the UI
-            c_copy['available_tabs'] = [t['name'] for t in c_copy['tabs']]
+
+            # Skip network fetch if caller pre-populated metadata from cache
+            if skip_if_cached and c_copy.get('available_tabs'):
+                c_copy.setdefault('replay_course_id', '')
+                c_copy['has_replay'] = bool(c_copy.get('replay_course_id'))
+                return c_copy
+
+            course_url = c_copy.get('url')
+            if not course_url:
+                c_copy.setdefault('available_tabs', [])
+                c_copy.setdefault('replay_course_id', '')
+                c_copy.setdefault('has_replay', False)
+                return c_copy
+
+            # Single HTTP request – reused for both tab discovery and replay detection
+            try:
+                response = self.session.get(course_url, timeout=20)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
+            except Exception as e:
+                logger.error(f"Failed to fetch page for {c_copy.get('name')}: {e}")
+                c_copy.setdefault('available_tabs', [])
+                c_copy.setdefault('replay_course_id', '')
+                c_copy.setdefault('has_replay', False)
+                return c_copy
+
+            tabs = self._parse_tabs_from_soup(soup, response.url, c_copy)
+            c_copy['tabs'] = tabs
+            c_copy['available_tabs'] = [t['name'] for t in tabs]
+
+            replay_id = self._discover_replay_id_from_soup(soup, response.url, c_copy)
+            c_copy['replay_course_id'] = replay_id or ''
+            c_copy['has_replay'] = bool(replay_id)
+
             return c_copy
 
         enriched_courses = []
-        # Use parallel execution to speed up metadata fetching
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(_enrich_course, c): c for c in courses}
             for future in as_completed(futures):
@@ -250,9 +463,8 @@ class Downloader:
                     enriched_courses.append(future.result())
                 except Exception as e:
                     logger.error(f"Error enriching course: {e}")
-                    # Return original course if enrichment fails
-                    enriched_courses.append(courses[futures[future]])
-        
+                    enriched_courses.append(futures[future])  # fall back to original
+
         return enriched_courses
     
     def download_courses(self, courses: List[Dict]):
@@ -265,6 +477,9 @@ class Downloader:
 
         try:
             for idx, course in enumerate(courses):
+                if self._check_stop():
+                    logger.info("Download stopped by user.")
+                    break
                 self.progress['current_course_index'] = idx + 1
                 self.download_course(course)
         finally:
@@ -315,7 +530,7 @@ class Downloader:
 
             # 🔑 根据 selected_tabs 过滤要下载的区域
             selected_tabs = course.get('selected_tabs', [])
-            
+
             if selected_tabs:
                 # 用户有明确选择 - 只处理选中的标签页
                 filtered_areas = [area for area in content_areas if area['name'] in selected_tabs]
@@ -330,7 +545,14 @@ class Downloader:
                 logger.info(f"  No tabs selected, skipping download")
                 return
 
+            # Phase 1: Scan all content areas to discover files
+            self.progress['phase'] = 'scanning'
+            self._emit_progress()
+
+            all_files = []
             for area in content_areas:
+                if self._check_stop():
+                    return
                 area_name = self._sanitize_name(area['name'])
                 if area.get('flatten'):
                     area_dir = course_dir
@@ -338,8 +560,44 @@ class Downloader:
                     area_dir = course_dir / area_name
                     area_dir.mkdir(parents=True, exist_ok=True)
 
-                logger.info(f"\n  Processing: {area_name}")
-                self._process_content_area(area['url'], area_dir)
+                logger.info(f"\n  Scanning: {area_name}")
+                all_files.extend(self._scan_content_area(area['url'], area_dir))
+
+            if not all_files:
+                logger.info(f"  No files found for {course_name}")
+                return
+
+            # Phase 2: Download all discovered files
+            self.progress['phase'] = 'downloading'
+            self.progress['course_files_total'] = len(all_files)
+            self.progress['course_files_done'] = 0
+            self.progress['bytes_downloaded'] = 0
+            self.progress['bytes_expected'] = 0
+            self._emit_progress()
+
+            logger.info(f"  Found {len(all_files)} files, starting download...")
+
+            max_workers = self.config.getint('concurrent_downloads', 3)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for url, file_path, link_text in all_files:
+                    if self._stop_event.is_set():
+                        break
+                    future = executor.submit(self._download_file, url, file_path, link_text)
+                    futures.append(future)
+
+                # On stop, cancel pending futures
+                if self._stop_event.is_set():
+                    for future in futures:
+                        future.cancel()
+                    return
+
+                # Wait for downloads to complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.debug(f"      Download error: {e}")
 
         except requests.RequestException as e:
             logger.error(f"Network error processing course {course_name}: {e}")
@@ -385,6 +643,8 @@ class Downloader:
         processed_folders = set()
         
         while current_url:
+            if self._stop_event.is_set():
+                return
             try:
                 response = self.session.get(current_url, timeout=30)
                 response.raise_for_status()
@@ -420,13 +680,16 @@ class Downloader:
     def _process_content_list(self, content_list, base_url: str, local_dir: Path, processed_folders: set):
         """Process links in content list."""
         links = content_list.find_all('a', href=True)
-        
+
         # Use thread pool for concurrent downloads
         max_workers = self.config.getint('concurrent_downloads', 3)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
 
             for link in links:
+                if self._stop_event.is_set():
+                    break
+
                 href = link.get('href', '')
                 text = link.text.strip()
 
@@ -454,6 +717,12 @@ class Downloader:
                         future = executor.submit(self._download_file, full_url, file_path, text)
                         futures.append(future)
 
+            # On stop, cancel pending futures
+            if self._stop_event.is_set():
+                for future in futures:
+                    future.cancel()
+                return
+
             # Wait for downloads to complete
             for future in as_completed(futures):
                 try:
@@ -461,6 +730,85 @@ class Downloader:
                 except Exception as e:
                     logger.debug(f"      Download error: {e}")
     
+    def _scan_content_area(self, url: str, local_dir: Path) -> List[Tuple[str, Path, str]]:
+        """Scan a content area and return list of (url, file_path, link_text) without downloading."""
+        results = []
+        current_url = url
+        processed_folders = set()
+
+        while current_url:
+            if self._stop_event.is_set():
+                return results
+            try:
+                response = self.session.get(current_url, timeout=30)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
+
+                content_list = soup.find('ul', id='content_listContainer')
+                if not content_list:
+                    content_list = soup.select_one('div.container-fluid ul.listElement')
+
+                if content_list:
+                    results.extend(self._scan_content_list(content_list, response.url, local_dir, processed_folders))
+
+                # Check for next page
+                next_link = soup.find('a', title='下一页')
+                if next_link and next_link.get('href'):
+                    next_url = urljoin(response.url, next_link['href'])
+                    if next_url != current_url:
+                        current_url = next_url
+                        time.sleep(0.5)
+                    else:
+                        current_url = None
+                else:
+                    current_url = None
+
+            except requests.RequestException as e:
+                logger.error(f"    Network error scanning content area: {e}")
+                current_url = None
+            except Exception as e:
+                logger.error(f"    Error scanning content area: {e}")
+                current_url = None
+
+        return results
+
+    def _scan_content_list(self, content_list, base_url: str, local_dir: Path, processed_folders: set) -> List[Tuple[str, Path, str]]:
+        """Scan links in content list and return file info tuples without downloading."""
+        results = []
+        links = content_list.find_all('a', href=True)
+
+        for link in links:
+            if self._stop_event.is_set():
+                break
+
+            href = link.get('href', '')
+            text = link.text.strip()
+
+            if not href or href.startswith('#') or href.startswith('javascript:'):
+                continue
+
+            full_url = urljoin(base_url, href)
+
+            # Check if it's a folder
+            if self._is_folder(link, href):
+                folder_name = self._sanitize_name(text or "Unnamed_Folder")
+                if full_url not in processed_folders:
+                    processed_folders.add(full_url)
+                    folder_dir = local_dir / folder_name
+                    folder_dir.mkdir(parents=True, exist_ok=True)
+                    # Recursively scan folder
+                    results.extend(self._scan_content_area(full_url, folder_dir))
+                continue
+
+            # Check if it's a file
+            if self._is_file(link, href, text):
+                filename = self._extract_filename(href, text)
+                if filename:
+                    file_path = local_dir / filename
+                    results.append((full_url, file_path, text))
+
+        return results
+
     def _is_folder(self, link, href: str) -> bool:
         """Check if link is a folder."""
         if 'listContent.jsp' in href or 'listContentEditable.jsp' in href:
@@ -531,12 +879,13 @@ class Downloader:
     
     def _download_file(self, url: str, file_path: Path, link_text: Optional[str] = None) -> bool:
         """Download a single file."""
+        # Check stop before starting
+        if self._check_stop():
+            return False
+
         # Update progress - starting new file
         self.progress['current_file_name'] = link_text or file_path.name
         self.progress['current_file_progress'] = 0.0
-        self.progress['current_file_size'] = 0
-        self.progress['current_file_downloaded'] = 0
-        self.progress['course_files_total'] += 1
         self._emit_progress()
 
         # Determine overwrite behavior and preflight HEAD
@@ -547,7 +896,9 @@ class Downloader:
             head_resp = self.session.head(url, timeout=10, allow_redirects=True)
             remote_size = int(head_resp.headers.get('Content-Length', -1))
             head_ct = head_resp.headers.get('Content-Type')
-            self.progress['current_file_size'] = remote_size
+            if remote_size > 0:
+                with self._progress_lock:
+                    self.progress['bytes_expected'] += remote_size
         except Exception:
             pass
 
@@ -573,7 +924,11 @@ class Downloader:
         if file_path.exists():
             if overwrite_mode == 'never':
                 self.stats['skipped'] += 1
-                self.progress['course_files_done'] += 1
+                self._increment_files_done()
+                skip_size = remote_size if remote_size > 0 else (file_path.stat().st_size if file_path.exists() else 0)
+                if skip_size > 0:
+                    with self._progress_lock:
+                        self.progress['bytes_downloaded'] += skip_size
                 self._record_file('skipped', file_path.name, reason='already_exists', file_path=file_path)
                 self._emit_progress()
                 return False
@@ -581,7 +936,9 @@ class Downloader:
                 try:
                     if file_path.stat().st_size == remote_size:
                         self.stats['skipped'] += 1
-                        self.progress['course_files_done'] += 1
+                        self._increment_files_done()
+                        with self._progress_lock:
+                            self.progress['bytes_downloaded'] += remote_size
                         logger.info(f"      [SKIP] (same size): {file_path.name}")
                         self._record_file('skipped', file_path.name, reason='same_size', size=remote_size, file_path=file_path)
                         self._emit_progress()
@@ -604,7 +961,6 @@ class Downloader:
 
             # Get actual file size from response
             total_size = int(response.headers.get('Content-Length', 0))
-            self.progress['current_file_size'] = total_size
             downloaded = 0
 
             # Read first chunk to sniff content (but also write it later)
@@ -634,7 +990,9 @@ class Downloader:
                         try:
                             if new_path.stat().st_size == resp_size:
                                 self.stats['skipped'] += 1
-                                self.progress['course_files_done'] += 1
+                                self._increment_files_done()
+                                with self._progress_lock:
+                                    self.progress['bytes_downloaded'] += resp_size
                                 logger.info(f"      [SKIP] (same size): {new_path.name}")
                                 self._record_file('skipped', new_path.name, reason='same_size', size=resp_size, file_path=new_path)
                                 self._emit_progress()
@@ -645,29 +1003,45 @@ class Downloader:
                     file_path = new_path
 
             # Write file (including the sniffed first chunk)
+            stopped_during_write = False
             with open(file_path, 'wb') as f:
                 if first_chunk:
                     f.write(first_chunk)
                     downloaded += len(first_chunk)
+                    with self._progress_lock:
+                        self.progress['bytes_downloaded'] += len(first_chunk)
                     if total_size > 0:
                         self.progress['current_file_progress'] = downloaded / total_size
-                        self.progress['current_file_downloaded'] = downloaded
-                        self._emit_progress()
+                    self._emit_progress()
 
                 for chunk in iterator:
+                    if self._stop_event.is_set():
+                        stopped_during_write = True
+                        break
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
+                        with self._progress_lock:
+                            self.progress['bytes_downloaded'] += len(chunk)
 
                         # Update progress
                         if total_size > 0:
                             self.progress['current_file_progress'] = downloaded / total_size
-                            self.progress['current_file_downloaded'] = downloaded
-                            self._emit_progress()
+                        self._emit_progress()
+
+            # Clean up partial file on stop
+            if stopped_during_write:
+                try:
+                    if file_path.exists():
+                        file_path.unlink()
+                        logger.info(f"      [STOP] Removed partial: {file_path.name}")
+                except Exception:
+                    pass
+                return False
 
             logger.info(f"      [OK] {file_path.name}")
             self.stats['downloaded'] += 1
-            self.progress['course_files_done'] += 1
+            self._increment_files_done()
             final_size = file_path.stat().st_size
             self._record_file('downloaded', file_path.name, size=final_size, url=url, file_path=file_path)
             self._emit_progress()
@@ -676,7 +1050,7 @@ class Downloader:
         except requests.RequestException as e:
             logger.warning(f"      [FAIL] {file_path.name}: {str(e)[:50]}")
             self.stats['failed'] += 1
-            self.progress['course_files_done'] += 1
+            self._increment_files_done()
             self._record_file('failed', file_path.name, error=str(e), error_type='NetworkError', file_path=file_path)
             self._emit_progress()
 
@@ -688,7 +1062,7 @@ class Downloader:
         except Exception as e:
             logger.error(f"      [FAIL] {file_path.name}: {str(e)[:50]}")
             self.stats['failed'] += 1
-            self.progress['course_files_done'] += 1
+            self._increment_files_done()
             self._record_file('failed', file_path.name, error=str(e), error_type='UnknownError', traceback=traceback.format_exc(), file_path=file_path)
             self._emit_progress()
 
@@ -734,6 +1108,265 @@ class Downloader:
         
         return name
     
+    def download_replays(self, course: Dict, replays: List[Dict]):
+        """Download replay videos for a course.
+
+        Args:
+            course: Course dict with name, alias, etc.
+            replays: List of replay dicts (from replay.parse_replay_list),
+                     filtered to only those the user selected.
+        """
+        raw_name = course.get('alias') or course.get('name', 'Unknown')
+        course_name = self._sanitize_name(raw_name)
+        self.current_course_name = course_name
+        self.current_course_id = course.get('id', 'unknown')
+
+        replay_dir = Path(self.config.get('download_dir')) / course_name / '_录播回放'
+        replay_dir.mkdir(parents=True, exist_ok=True)
+        self.current_course_dir = replay_dir.parent
+
+        self.progress['current_course_name'] = f"{course_name} (录播)"
+        self.progress['course_files_total'] = len(replays)
+        self.progress['course_files_done'] = 0
+        self.progress['phase'] = 'downloading'
+        self._emit_progress()
+
+        logger.info(f"\n=== Downloading replays: {course_name} ({len(replays)} videos) ===")
+
+        def _normalize(v):
+            return str(v or '').strip()
+
+        def _build_replay_lookup(items: List[Dict]):
+            by_id = {}
+            by_full_meta = {}
+            by_sub_title = {}
+            for item in items or []:
+                replay_id = _normalize(item.get('replay_id'))
+                if replay_id:
+                    by_id[replay_id] = item
+                sub_title = _normalize(item.get('sub_title'))
+                lecturer_name = _normalize(item.get('lecturer_name'))
+                title = _normalize(item.get('title'))
+                if sub_title:
+                    by_sub_title[sub_title] = item
+                by_full_meta[(sub_title, lecturer_name, title)] = item
+            return by_id, by_full_meta, by_sub_title
+
+        def _match_replay(lookup_tuple, replay_dict):
+            by_id, by_full_meta, by_sub_title = lookup_tuple
+            replay_id = _normalize(replay_dict.get('replay_id'))
+            item = by_id.get(replay_id) if replay_id else None
+            if not item:
+                item = by_full_meta.get((
+                    _normalize(replay_dict.get('sub_title')),
+                    _normalize(replay_dict.get('lecturer_name')),
+                    _normalize(replay_dict.get('title')),
+                ))
+            if not item:
+                item = by_sub_title.get(_normalize(replay_dict.get('sub_title')))
+            return item
+
+        def _inject_session_cookies(driver):
+            """Inject session cookies (iaaa + course.pku.edu.cn) into a Selenium browser."""
+            iaaa_cookies = [c for c in self.session.cookies if 'iaaa' in (c.domain or '')]
+            if iaaa_cookies:
+                logger.info("  [REPLAY] Injecting iaaa SSO cookies into browser...")
+                driver.get('https://iaaa.pku.edu.cn')
+                for c in iaaa_cookies:
+                    try:
+                        driver.add_cookie({
+                            'name': c.name,
+                            'value': c.value,
+                            'domain': c.domain or 'iaaa.pku.edu.cn',
+                            'path': c.path or '/'
+                        })
+                    except Exception:
+                        continue
+            else:
+                logger.warning("  [REPLAY] No iaaa cookies found in session — SSO may fail.")
+            driver.get('https://course.pku.edu.cn')
+            for c in self.session.cookies:
+                if 'iaaa' in (c.domain or ''):
+                    continue
+                try:
+                    driver.add_cookie({
+                        'name': c.name,
+                        'value': c.value,
+                        'domain': c.domain or '.pku.edu.cn',
+                        'path': c.path or '/'
+                    })
+                except Exception:
+                    continue
+
+        def _resolve_all_unresolved_via_selenium(replays_list: List[Dict]):
+            """Open ONE browser, resolve all playVideo token URLs to real download URLs.
+
+            Navigates to each replay's token URL individually using the same driver so
+            cookies are only injected once and the browser is only opened once.
+            The XHR interceptor is registered via CDP Page.addScriptToEvaluateOnNewDocument
+            once; it fires automatically before page JS on every subsequent navigation.
+            """
+            from ..browser import get_driver
+            from ..replay import XHR_INTERCEPTOR_JS, parse_replay_list, extract_jwt_from_play_url
+
+            logger.info(
+                f"  [REPLAY] Opening browser to resolve {len(replays_list)} URL(s) "
+                f"(one navigation per video, same browser instance)..."
+            )
+            browser = self.config.get('browser')
+            headless = self.config.getbool('headless', False)
+            driver = get_driver(browser=browser, headless=headless)
+            try:
+                _inject_session_cookies(driver)
+
+                # Register CDP XHR interceptor ONCE — fires before any page JS on
+                # every subsequent navigation, eliminating the race condition.
+                try:
+                    driver.execute_cdp_cmd(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        {"source": XHR_INTERCEPTOR_JS}
+                    )
+                    logger.debug("  [REPLAY] XHR interceptor registered via CDP")
+                except Exception as _cdp_err:
+                    logger.warning(f"  [REPLAY] CDP registration failed: {_cdp_err}")
+
+                total = len(replays_list)
+                for idx, replay in enumerate(replays_list, 1):
+                    play_url = str(replay.get('download_url', ''))
+                    if not play_url:
+                        continue
+
+                    jwt_token = extract_jwt_from_play_url(play_url)
+                    logger.info(
+                        f"  [REPLAY] [{idx}/{total}] {replay.get('filename', play_url[:60])}"
+                    )
+
+                    try:
+                        driver.get(play_url)
+                    except Exception as _nav_err:
+                        logger.warning(f"    [REPLAY] Navigation failed: {_nav_err}")
+                        continue
+
+                    # Poll for XHR capture (max 60s per video).
+                    max_wait = 60
+                    poll_start = time.time()
+                    last_log = poll_start
+                    data = None
+                    while time.time() - poll_start < max_wait:
+                        try:
+                            data = driver.execute_script(
+                                "return window.__PKU_GET_REPLAY_DATA;"
+                            )
+                        except Exception:
+                            time.sleep(0.5)
+                            continue
+                        if data:
+                            break
+                        if time.time() - last_log >= 10:
+                            try:
+                                logger.debug(
+                                    f"    [REPLAY] Waiting... "
+                                    f"{int(time.time() - poll_start)}s, "
+                                    f"URL: {driver.current_url[:80]}"
+                                )
+                            except Exception:
+                                pass
+                            last_log = time.time()
+                        time.sleep(0.5)
+
+                    if not data:
+                        logger.warning(
+                            f"    [REPLAY] Timed out: {replay.get('filename', '')}"
+                        )
+                        continue
+
+                    fresh_entries = parse_replay_list(data)
+                    if not fresh_entries:
+                        logger.warning(
+                            f"    [REPLAY] No parseable data: {replay.get('filename', '')}"
+                        )
+                        continue
+
+                    # Match by hqySubId from JWT, then sub_title, then first entry.
+                    sub_id = ''
+                    if jwt_token:
+                        payload = self._decode_jwt_payload(jwt_token)
+                        if payload:
+                            sub_id = str(payload.get('hqySubId', '')).strip()
+
+                    matched = None
+                    if sub_id:
+                        matched = next(
+                            (r for r in fresh_entries
+                             if str(r.get('replay_id', '')) == sub_id),
+                            None
+                        )
+                    if not matched:
+                        matched = next(
+                            (r for r in fresh_entries
+                             if _normalize(r.get('sub_title'))
+                             == _normalize(replay.get('sub_title'))),
+                            None
+                        )
+                    if not matched:
+                        matched = fresh_entries[0]
+
+                    resolved = _normalize(matched.get('download_url')) if matched else ''
+                    if resolved:
+                        replay['download_url'] = resolved
+                        logger.debug(f"    [REPLAY] ✓ {replay.get('filename', '')}")
+                    else:
+                        logger.warning(
+                            f"    [REPLAY] Empty URL for: {replay.get('filename', '')}"
+                        )
+
+            except Exception as e:
+                logger.warning(f"  [REPLAY] Selenium resolution failed: {e}")
+            finally:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+        # ── Resolve all token URLs upfront in ONE browser session ─────────────
+        unresolved = [
+            r for r in replays
+            if 'playVideo.action' in str(r.get('download_url', ''))
+        ]
+        if unresolved:
+            logger.info(f"  [REPLAY] {len(unresolved)} replay(s) need URL resolution...")
+            _resolve_all_unresolved_via_selenium(unresolved)
+
+        for replay in replays:
+            if self._check_stop():
+                return
+
+            filename = self._sanitize_name(replay['filename'])
+            if not filename.lower().endswith('.mp4'):
+                filename += '.mp4'
+
+            file_path = replay_dir / filename
+            download_url = replay['download_url']
+
+            # If the URL is still a token URL here, the upfront Selenium pass
+            # failed to match this entry — log and skip rather than re-opening a browser.
+            if 'playVideo.action' in str(download_url):
+                logger.warning(f"      [FAIL] {file_path.name}: replay URL still unresolved after Selenium pass")
+                self.stats['failed'] += 1
+                self._increment_files_done()
+                self._record_file(
+                    'failed',
+                    file_path.name,
+                    error="Replay URL unresolved after upfront Selenium resolution",
+                    error_type='ReplayResolveError',
+                    file_path=file_path
+                )
+                self._emit_progress()
+                continue
+
+            logger.info(f"    [REPLAY] {filename}")
+            self._download_file(download_url, file_path, replay.get('sub_title', filename))
+
     def print_stats(self):
         """Print download statistics."""
         logger.info(f"\n=== Download Statistics ===")
@@ -787,7 +1420,7 @@ class Downloader:
                 'started_at': self.started_at.strftime("%Y-%m-%d %H:%M:%S"),
                 'finished_at': finished_at.strftime("%Y-%m-%d %H:%M:%S"),
                 'duration_seconds': int((finished_at - self.started_at).total_seconds()),
-                'status': 'success' if self.stats['failed'] == 0 else 'partial_failure',
+                'status': 'stopped' if self._stop_event.is_set() else ('success' if self.stats['failed'] == 0 else 'partial_failure'),
                 'files': self.file_records,
                 'summary': self.stats
             }

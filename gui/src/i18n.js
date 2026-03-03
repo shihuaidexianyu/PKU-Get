@@ -31,6 +31,10 @@ export const translations = {
     syncNow: 'Sync Now',
     syncing: 'Syncing...',
     refreshCourses: 'Refresh Courses',
+    refreshCourseInfo: 'Refresh Course Info',
+    refreshingCourseInfo: 'Refreshing...',
+    refreshCourseInfoDone: 'Course info updated!',
+    refreshCourseInfoTooltip: 'Re-fetch available sections for all courses (detects newly added tabs)',
     viewSyncHistory: 'View Sync History',
 
     // Course Card
@@ -73,6 +77,8 @@ export const translations = {
 
     // Progress Bar
     syncingCourse: 'Syncing:',
+    scanningCourse: 'Scanning:',
+    scanningFiles: 'Scanning files...',
     course: 'Course',
     currentFile: 'Current file:',
     courseProgress: 'Course Progress',
@@ -80,6 +86,11 @@ export const translations = {
     expandLog: 'Expand Log',
     collapse: 'Collapse',
     clickToExpand: 'Click to expand',
+    pause: 'Pause',
+    resume: 'Resume',
+    stop: 'Stop',
+    paused: 'Paused',
+    stopped: 'Stopped',
 
     // Stats
     downloaded: 'Downloaded',
@@ -110,6 +121,21 @@ export const translations = {
     never: 'Never',
     yes: 'Yes',
     no: 'No',
+
+    // Replays
+    downloadReplays: 'Replays',
+    fetchReplayList: 'Fetch Replay List',
+    fetchingReplays: 'Fetching...',
+    noReplays: 'No replays found',
+    replaysAvailable: 'replays',
+
+    // Historical Courses
+    historicalCourse: 'Historical',
+    showHistoryToggle: 'Show History Courses Option',
+    showHistoryToggleDesc: 'Display the option to include historical courses',
+    includeHistory: 'Include Historical Courses',
+    includeHistoryDesc: 'Fetch courses from previous semesters on next login',
+    historicalCoursesSection: 'Historical Courses',
   },
 
   zh: {
@@ -139,6 +165,10 @@ export const translations = {
     syncNow: '立即同步',
     syncing: '同步中...',
     refreshCourses: '刷新课程',
+    refreshCourseInfo: '刷新课程信息',
+    refreshingCourseInfo: '刷新中...',
+    refreshCourseInfoDone: '课程信息已更新！',
+    refreshCourseInfoTooltip: '重新获取各课程的可用板块（检测新增模块）',
     viewSyncHistory: '查看同步历史',
 
     // Course Card
@@ -181,6 +211,8 @@ export const translations = {
 
     // Progress Bar
     syncingCourse: '正在同步：',
+    scanningCourse: '正在扫描：',
+    scanningFiles: '正在扫描文件...',
     course: '课程',
     currentFile: '当前文件：',
     courseProgress: '课程进度',
@@ -188,6 +220,11 @@ export const translations = {
     expandLog: '展开日志',
     collapse: '收起',
     clickToExpand: '点击展开',
+    pause: '暂停',
+    resume: '继续',
+    stop: '停止',
+    paused: '已暂停',
+    stopped: '已停止',
 
     // Stats
     downloaded: '已下载',
@@ -218,6 +255,21 @@ export const translations = {
     never: '从未',
     yes: '是',
     no: '否',
+
+    // Replays
+    downloadReplays: '录播',
+    fetchReplayList: '获取录播列表',
+    fetchingReplays: '获取中...',
+    noReplays: '未找到录播',
+    replaysAvailable: '节录播',
+
+    // Historical Courses
+    historicalCourse: '历史课程',
+    showHistoryToggle: '显示历史课程选项',
+    showHistoryToggleDesc: '显示是否包含历史课程的选项',
+    includeHistory: '包含历史课程',
+    includeHistoryDesc: '下次登录时获取往期学期的课程',
+    historicalCoursesSection: '历史课程',
   }
 };
 

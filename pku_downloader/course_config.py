@@ -21,14 +21,19 @@ def _default_entry(course: Dict[str, Any]) -> Dict[str, Any]:
     # 🔑 默认 selected_tabs：优先选择"教学内容"，如果没有则为空
     available_tabs = course.get("available_tabs", [])
     default_tabs = ["教学内容"] if "教学内容" in available_tabs else []
-    
+    is_historical = course.get("is_historical", False)
+
     return {
         "name": course.get("name", ""),
         "alias": "",
-        "skip": False,
+        "skip": True if is_historical else False,
         "sections": list(DEFAULT_SECTIONS),
         "flatten": DEFAULT_FLATTEN,
         "selected_tabs": default_tabs,  # GUI 需要的字段
+        "download_replays": False,
+        "selected_replays": [],
+        "available_replays": [],
+        "is_historical": is_historical,
     }
 
 
@@ -104,8 +109,16 @@ def ensure_course_config(config_path: Path, courses: List[Dict[str, Any]]) -> Tu
         entry['flatten'] = bool(entry.get('flatten', DEFAULT_FLATTEN))
         entry['skip'] = bool(entry.get('skip', False))
         entry['alias'] = str(entry.get('alias') or "").strip()
+        # Always reflect the live is_historical flag from the course data
+        entry['is_historical'] = course.get('is_historical', entry.get('is_historical', False))
 
         normalised[course_id] = entry
+
+    # Preserve historical courses already in the file that weren't in the fresh course list.
+    # This prevents wiping history entries when syncing without include_history=True.
+    for cid, entry in data.items():
+        if cid not in normalised and entry.get('is_historical', False):
+            normalised[cid] = entry
 
     if normalised != data or created:
         payload = {

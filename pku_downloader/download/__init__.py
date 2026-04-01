@@ -255,6 +255,7 @@ class Downloader:
                 logger.debug(
                     f"      [infer-post] '{file_path.name}' -> '{renamed.name}' via {source}"
                 )
+                self.optimization_stats["renamed_by_extension_infer"] += 1
             return renamed
         except Exception:
             return file_path
@@ -358,6 +359,14 @@ class Downloader:
         except Exception:
             return None
 
+    def _is_retryable_status(self, status_code: int) -> bool:
+        """HTTP status codes worth retrying."""
+        return status_code in {429, 500, 502, 503, 504}
+
+    def _is_non_retryable_status(self, status_code: int) -> bool:
+        """HTTP status codes that should fail fast."""
+        return status_code in {400, 401, 403, 404}
+
     def _compute_file_md5(self, file_path: Path) -> Optional[str]:
         """Compute MD5 for a file. Returns None on failure."""
         try:
@@ -398,7 +407,12 @@ class Downloader:
         if not file_path.exists() or file_path.stat().st_size <= 0:
             return False, None
 
-        root_dir = self.current_course_dir if self.current_course_dir else file_path.parent
+        dedupe_scope = str(self.config.get("md5_dedupe_scope", "course")).strip().lower()
+        if dedupe_scope == "global":
+            root_dir = Path(self.config.get("download_dir"))
+        else:
+            root_dir = self.current_course_dir if self.current_course_dir else file_path.parent
+
         self._ensure_md5_index_for_root(root_dir)
 
         md5_hex = self._compute_file_md5(file_path)
@@ -428,6 +442,40 @@ class Downloader:
             return True, existing_path
 
         return False, None
+
+    def _load_resource_cache(self):
+        try:
+            if self._resource_cache_path.exists():
+                with open(self._resource_cache_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self._resource_cache = data
+        except Exception:
+            self._resource_cache = {}
+
+    def _save_resource_cache(self):
+        try:
+            with self._resource_cache_lock:
+                payload = dict(self._resource_cache)
+            with open(self._resource_cache_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _update_resource_cache_entry(
+        self,
+        url: str,
+        etag: Optional[str],
+        last_modified: Optional[str],
+        size: Optional[int],
+    ):
+        with self._resource_cache_lock:
+            self._resource_cache[url] = {
+                "etag": etag or "",
+                "last_modified": last_modified or "",
+                "size": int(size) if isinstance(size, int) else -1,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
 
     def _extract_hqy_course_id_from_playvideo_href(self, href: str) -> Optional[str]:
         """Extract hqyCourseId from playVideo.action JWT token URL."""
@@ -502,6 +550,15 @@ class Downloader:
         self._ssl_warning_emitted = False
         self._md5_index_by_root: Dict[str, Dict[str, str]] = {}
         self._md5_lock = threading.Lock()
+        self.optimization_stats = {
+            "retried_count": 0,
+            "deduped_by_md5": 0,
+            "renamed_by_extension_infer": 0,
+        }
+        self._resource_cache_path = config_dir / "resource_cache.json"
+        self._resource_cache: Dict[str, Dict[str, object]] = {}
+        self._resource_cache_lock = threading.Lock()
+        self._load_resource_cache()
 
     def _request_with_ssl_fallback(self, method: str, url: str, **kwargs):
         """Perform HTTP request with SSL cert fallback for campus-network environments.
@@ -509,33 +566,76 @@ class Downloader:
         First try normal certificate verification. If it fails with SSLError,
         retry once with verify=False and emit a clear warning.
         """
-        try:
-            return self.session.request(method, url, **kwargs)
-        except requests.exceptions.SSLError as ssl_err:
-            if kwargs.get("verify", True) is False:
-                raise
+        retry_count = max(0, self.config.getint("retry_count", 3))
+        backoff_base = 1.0
+        verify_ssl = kwargs.get("verify", True)
+        request_kwargs = dict(kwargs)
 
-            if not self._ssl_warning_emitted:
-                logger.warning(
-                    "SSL certificate verification failed. "
-                    "Retrying with certificate verification disabled for this session. "
-                    "This is common on campus networks with custom certificates."
-                )
-                self._ssl_warning_emitted = True
-
-            self._ssl_fallback_enabled = True
-
+        for attempt in range(retry_count + 1):
             try:
-                import urllib3
+                response = self.session.request(method, url, **request_kwargs)
 
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            except Exception:
-                pass
+                if self._is_non_retryable_status(response.status_code):
+                    return response
 
-            retry_kwargs = dict(kwargs)
-            retry_kwargs["verify"] = False
-            logger.debug(f"[SSL-FALLBACK] {method.upper()} {url}")
-            return self.session.request(method, url, **retry_kwargs)
+                if (
+                    self._is_retryable_status(response.status_code)
+                    and attempt < retry_count
+                ):
+                    delay = backoff_base * (2**attempt)
+                    self.optimization_stats["retried_count"] += 1
+                    logger.warning(
+                        f"HTTP {response.status_code} for {method.upper()} {url}. "
+                        f"Retrying in {delay:.1f}s ({attempt + 1}/{retry_count})..."
+                    )
+                    time.sleep(delay)
+                    continue
+
+                return response
+
+            except requests.exceptions.SSLError:
+                if verify_ssl is False:
+                    raise
+
+                if not self._ssl_warning_emitted:
+                    logger.warning(
+                        "SSL certificate verification failed. "
+                        "Retrying with certificate verification disabled for this session. "
+                        "This is common on campus networks with custom certificates."
+                    )
+                    self._ssl_warning_emitted = True
+
+                self._ssl_fallback_enabled = True
+                verify_ssl = False
+                request_kwargs["verify"] = False
+
+                try:
+                    import urllib3
+
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                except Exception:
+                    pass
+
+                self.optimization_stats["retried_count"] += 1
+                logger.debug(f"[SSL-FALLBACK] {method.upper()} {url}")
+                continue
+
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ) as e:
+                if attempt >= retry_count:
+                    raise
+                delay = backoff_base * (2**attempt)
+                self.optimization_stats["retried_count"] += 1
+                logger.warning(
+                    f"Network error for {method.upper()} {url}: {e}. "
+                    f"Retrying in {delay:.1f}s ({attempt + 1}/{retry_count})..."
+                )
+                time.sleep(delay)
+                continue
+
+        return self.session.request(method, url, **request_kwargs)
 
     def _get(self, url: str, **kwargs):
         return self._request_with_ssl_fallback("get", url, **kwargs)
@@ -1302,10 +1402,14 @@ class Downloader:
         overwrite_mode = self.config.get("overwrite", "size")
         remote_size = -1
         head_ct = None
+        head_etag = ""
+        head_last_modified = ""
         try:
             head_resp = self._head(url, timeout=10, allow_redirects=True)
             remote_size = int(head_resp.headers.get("Content-Length", -1))
             head_ct = head_resp.headers.get("Content-Type")
+            head_etag = head_resp.headers.get("ETag", "")
+            head_last_modified = head_resp.headers.get("Last-Modified", "")
             if remote_size > 0:
                 with self._progress_lock:
                     self.progress["bytes_expected"] += remote_size
@@ -1327,10 +1431,44 @@ class Downloader:
                 )
                 if not ext_from_head and head_ct.startswith("image/jpeg"):
                     ext_from_head = ".jpg"
+                ext_from_head = self._normalize_extension(ext_from_head)
             else:
                 ext_from_head = None
             tentative_name = base_name + (ext_from_head or "")
         file_path = file_path.with_name(tentative_name)
+
+        # Metadata cache assisted skip (high-value fast path)
+        with self._resource_cache_lock:
+            cached_meta = self._resource_cache.get(url, {})
+
+        if file_path.exists() and overwrite_mode in ("never", "size") and cached_meta:
+            try:
+                local_size = file_path.stat().st_size
+            except Exception:
+                local_size = -1
+
+            cached_size = int(cached_meta.get("size", -1))
+            same_size = cached_size > -1 and local_size == cached_size
+
+            same_etag = bool(head_etag) and cached_meta.get("etag") == head_etag
+            same_lm = bool(head_last_modified) and cached_meta.get("last_modified") == head_last_modified
+
+            if same_size and (same_etag or same_lm):
+                self.stats["skipped"] += 1
+                self._increment_files_done()
+                if local_size > 0:
+                    with self._progress_lock:
+                        self.progress["bytes_downloaded"] += local_size
+                logger.info(f"      [SKIP] (metadata cache): {file_path.name}")
+                self._record_file(
+                    "skipped",
+                    file_path.name,
+                    reason="metadata_unchanged",
+                    size=local_size if local_size > 0 else None,
+                    file_path=file_path,
+                )
+                self._emit_progress()
+                return False
 
         # Overwrite/skip decision using preflight info
         if file_path.exists():
@@ -1366,6 +1504,12 @@ class Downloader:
                                 file_path, head_ct
                             )
                         )
+                        self._update_resource_cache_entry(
+                            url,
+                            head_etag,
+                            head_last_modified,
+                            file_path.stat().st_size if file_path.exists() else remote_size,
+                        )
                         self.stats["skipped"] += 1
                         self._increment_files_done()
                         with self._progress_lock:
@@ -1386,6 +1530,12 @@ class Downloader:
         # Download the file
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = file_path.with_name(file_path.name + ".part")
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
 
             response = self._get(url, stream=True, timeout=180)
             response.raise_for_status()
@@ -1453,7 +1603,7 @@ class Downloader:
 
             # Write file (including the sniffed first chunk)
             stopped_during_write = False
-            with open(file_path, "wb") as f:
+            with open(temp_path, "wb") as f:
                 if first_chunk:
                     f.write(first_chunk)
                     downloaded += len(first_chunk)
@@ -1483,12 +1633,15 @@ class Downloader:
             # Clean up partial file on stop
             if stopped_during_write:
                 try:
-                    if file_path.exists():
-                        file_path.unlink()
-                        logger.info(f"      [STOP] Removed partial: {file_path.name}")
+                    if temp_path.exists():
+                        temp_path.unlink()
+                        logger.info(f"      [STOP] Removed partial: {temp_path.name}")
                 except Exception:
                     pass
                 return False
+
+            # Atomic replace to avoid half-written files
+            os.replace(temp_path, file_path)
 
             # Post-download fallback: if file is still suffix-less, detect and append extension
             file_path = self._detect_and_append_extension_for_downloaded_file(
@@ -1503,6 +1656,7 @@ class Downloader:
                 except Exception:
                     pass
 
+                self.optimization_stats["deduped_by_md5"] += 1
                 self.stats["skipped"] += 1
                 self._increment_files_done()
 
@@ -1523,6 +1677,12 @@ class Downloader:
             self.stats["downloaded"] += 1
             self._increment_files_done()
             final_size = file_path.stat().st_size
+            self._update_resource_cache_entry(
+                url,
+                response.headers.get("ETag", head_etag),
+                response.headers.get("Last-Modified", head_last_modified),
+                final_size,
+            )
             self._record_file(
                 "downloaded",
                 file_path.name,
@@ -1547,6 +1707,8 @@ class Downloader:
             self._emit_progress()
 
             # Clean up partial download
+            if "temp_path" in locals() and temp_path.exists():
+                temp_path.unlink()
             if file_path.exists() and file_path.stat().st_size == 0:
                 file_path.unlink()
 
@@ -1566,6 +1728,8 @@ class Downloader:
             self._emit_progress()
 
             # Clean up partial download
+            if "temp_path" in locals() and temp_path.exists():
+                temp_path.unlink()
             if file_path.exists() and file_path.stat().st_size == 0:
                 file_path.unlink()
 
@@ -1902,6 +2066,12 @@ class Downloader:
         logger.info(f"Skipped:    {self.stats['skipped']}")
         logger.info(f"Failed:     {self.stats['failed']}")
         logger.info(f"Total:      {sum(self.stats.values())}")
+        logger.info("--- Optimizations ---")
+        logger.info(f"Retried requests: {self.optimization_stats['retried_count']}")
+        logger.info(f"MD5 deduped:      {self.optimization_stats['deduped_by_md5']}")
+        logger.info(
+            f"Extension inferred: {self.optimization_stats['renamed_by_extension_infer']}"
+        )
 
     def _record_file(self, status: str, filename: str, **kwargs):
         """Record file information for sync report."""
@@ -1957,11 +2127,14 @@ class Downloader:
                 else ("success" if self.stats["failed"] == 0 else "partial_failure"),
                 "files": self.file_records,
                 "summary": self.stats,
+                "optimizations": self.optimization_stats,
             }
 
             report_path = self.reports_dir / f"{self.sync_id}.json"
             with open(report_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
+
+            self._save_resource_cache()
 
             logger.info(f"\nSync report saved to: {report_path}")
             return report_path

@@ -7,6 +7,7 @@ import re
 import time
 import json
 import base64
+import hashlib
 import threading
 import requests
 import mimetypes
@@ -357,6 +358,77 @@ class Downloader:
         except Exception:
             return None
 
+    def _compute_file_md5(self, file_path: Path) -> Optional[str]:
+        """Compute MD5 for a file. Returns None on failure."""
+        try:
+            digest = hashlib.md5()
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    if chunk:
+                        digest.update(chunk)
+            return digest.hexdigest()
+        except Exception:
+            return None
+
+    def _ensure_md5_index_for_root(self, root_dir: Path):
+        """Build MD5 index for a root directory once (thread-safe)."""
+        root_key = str(root_dir.resolve())
+
+        with self._md5_lock:
+            if root_key in self._md5_index_by_root:
+                return
+
+        local_index: Dict[str, str] = {}
+        try:
+            if root_dir.exists():
+                for p in root_dir.rglob("*"):
+                    if not p.is_file():
+                        continue
+                    md5_hex = self._compute_file_md5(p)
+                    if md5_hex and md5_hex not in local_index:
+                        local_index[md5_hex] = str(p)
+        except Exception:
+            pass
+
+        with self._md5_lock:
+            self._md5_index_by_root.setdefault(root_key, local_index)
+
+    def _apply_md5_dedupe(self, file_path: Path) -> Tuple[bool, Optional[Path]]:
+        """Return (is_duplicate, existing_path_if_duplicate)."""
+        if not file_path.exists() or file_path.stat().st_size <= 0:
+            return False, None
+
+        root_dir = self.current_course_dir if self.current_course_dir else file_path.parent
+        self._ensure_md5_index_for_root(root_dir)
+
+        md5_hex = self._compute_file_md5(file_path)
+        if not md5_hex:
+            return False, None
+
+        root_key = str(root_dir.resolve())
+        existing_path = None
+
+        with self._md5_lock:
+            index = self._md5_index_by_root.setdefault(root_key, {})
+            existing_raw = index.get(md5_hex)
+
+            if existing_raw:
+                existing_candidate = Path(existing_raw)
+                # If index entry is stale, replace it with current file path
+                if not existing_candidate.exists():
+                    index[md5_hex] = str(file_path)
+                elif existing_candidate.resolve() != file_path.resolve():
+                    existing_path = existing_candidate
+                else:
+                    index[md5_hex] = str(file_path)
+            else:
+                index[md5_hex] = str(file_path)
+
+        if existing_path is not None:
+            return True, existing_path
+
+        return False, None
+
     def _extract_hqy_course_id_from_playvideo_href(self, href: str) -> Optional[str]:
         """Extract hqyCourseId from playVideo.action JWT token URL."""
         try:
@@ -428,6 +500,8 @@ class Downloader:
         self.window = None  # Will be set by gui.py
         self._ssl_fallback_enabled = False
         self._ssl_warning_emitted = False
+        self._md5_index_by_root: Dict[str, Dict[str, str]] = {}
+        self._md5_lock = threading.Lock()
 
     def _request_with_ssl_fallback(self, method: str, url: str, **kwargs):
         """Perform HTTP request with SSL cert fallback for campus-network environments.
@@ -1420,6 +1494,30 @@ class Downloader:
             file_path = self._detect_and_append_extension_for_downloaded_file(
                 file_path, response.headers.get("Content-Type")
             )
+
+            # MD5 dedupe (within current course directory)
+            is_duplicate, existing_path = self._apply_md5_dedupe(file_path)
+            if is_duplicate:
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+
+                self.stats["skipped"] += 1
+                self._increment_files_done()
+
+                existing_name = existing_path.name if existing_path else "existing file"
+                logger.info(
+                    f"      [SKIP] (duplicate md5): {file_path.name} -> same as {existing_name}"
+                )
+                self._record_file(
+                    "skipped",
+                    file_path.name,
+                    reason="duplicate_md5",
+                    file_path=file_path,
+                )
+                self._emit_progress()
+                return True
 
             logger.info(f"      [OK] {file_path.name}")
             self.stats["downloaded"] += 1

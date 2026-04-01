@@ -39,6 +39,7 @@ if sys.stderr:
 import json
 import threading
 import logging
+import re
 import webview
 import time
 from pathlib import Path
@@ -182,6 +183,30 @@ class Api:
             gui_logger.error(f"Scan error: {e}")
 
         return {"total": total_files, "courses": course_stats}
+
+    def _ensure_default_selected_tabs_for_courses(self):
+        """Auto-heal legacy empty selected_tabs.
+
+        Some historical caches have selected_tabs=[], which makes downloader
+        skip every course with 'No tabs selected'. For active courses, if
+        '教学内容' exists in available_tabs and selected_tabs is empty, we set
+        selected_tabs=['教学内容'].
+        """
+        changed = False
+
+        for course in self.courses:
+            if course.get("skip", False):
+                continue
+
+            selected_tabs = course.get("selected_tabs")
+            available_tabs = course.get("available_tabs") or []
+
+            if isinstance(selected_tabs, list) and len(selected_tabs) == 0:
+                if "教学内容" in available_tabs:
+                    course["selected_tabs"] = ["教学内容"]
+                    changed = True
+
+        return changed
 
     def load_config(self):
         """Load existing config or return defaults"""
@@ -900,6 +925,13 @@ class Api:
                 }
                 self.courses.append(course)
 
+            # 🔑 自动修复历史缓存中 selected_tabs 为空导致全部跳过下载的问题
+            if self._ensure_default_selected_tabs_for_courses():
+                self._save_all_courses()
+                gui_logger.info(
+                    "Auto-healed empty selected_tabs to default '教学内容' where applicable."
+                )
+
             gui_logger.info(f"Loaded {len(self.courses)} courses from cache.")
         except Exception as e:
             gui_logger.error(f"Failed to load saved courses: {e}")
@@ -1079,6 +1111,36 @@ def main():
             print("Please run 'cd gui && npm run build' to generate the interface.")
             return
         else:
+            try:
+                with open(dist_path, "r", encoding="utf-8") as f:
+                    html = f.read()
+
+                script_paths = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
+                style_paths = re.findall(r'<link[^>]+href=["\']([^"\']+)["\']', html)
+                referenced_assets = [
+                    p
+                    for p in (script_paths + style_paths)
+                    if p and not p.startswith(("http://", "https://", "data:"))
+                ]
+
+                missing_assets = []
+                dist_dir = os.path.dirname(dist_path)
+                for rel_path in referenced_assets:
+                    cleaned = rel_path.lstrip("./\\").replace("/", os.sep)
+                    asset_abs = os.path.join(dist_dir, cleaned)
+                    if not os.path.exists(asset_abs):
+                        missing_assets.append(rel_path)
+
+                if missing_assets:
+                    print("Error: GUI build assets are incomplete or outdated.")
+                    print("Missing files referenced by dist/index.html:")
+                    for item in missing_assets:
+                        print(f"  - {item}")
+                    print("Please run 'cd gui && npm run build' and restart.")
+                    return
+            except Exception as e:
+                print(f"Warning: Failed to validate GUI assets: {e}")
+
             url = f"file://{os.path.abspath(dist_path)}"
             print(f"Loading from File: {url}")
 

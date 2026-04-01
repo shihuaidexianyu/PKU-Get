@@ -37,36 +37,124 @@ class Downloader:
     """Download files from PKU's course system. It's not pretty but it works."""
 
     COMMON_EXTENSIONS = [
+        # Documents
         ".pdf",
+        ".txt",
+        ".rtf",
+        ".md",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".xml",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".log",
+        ".tex",
+        # Office
         ".doc",
         ".docx",
+        ".docm",
+        ".dot",
+        ".dotx",
         ".ppt",
         ".pptx",
+        ".pptm",
+        ".pps",
+        ".ppsx",
         ".xls",
         ".xlsx",
+        ".xlsm",
+        # Archives
         ".zip",
         ".rar",
         ".7z",
         ".tar",
+        ".tar.gz",
+        ".tar.bz2",
+        ".tar.xz",
         ".gz",
-        ".txt",
-        ".md",
+        ".bz2",
+        ".xz",
+        # Notebooks / data / code
         ".ipynb",
+        ".sqlite",
+        ".db",
+        ".sql",
+        ".py",
+        ".pyi",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".java",
+        ".c",
+        ".h",
+        ".cpp",
+        ".hpp",
+        ".cc",
+        ".cs",
+        ".go",
+        ".rs",
+        ".kt",
+        ".swift",
+        ".m",
+        ".mm",
+        ".sh",
+        ".bat",
+        ".ps1",
+        # Images
         ".jpg",
         ".jpeg",
+        ".jpe",
         ".png",
         ".gif",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".webp",
+        ".svg",
+        ".heic",
         ".swf",
+        # Audio / video
         ".mp4",
+        ".m4v",
+        ".mkv",
+        ".webm",
         ".avi",
         ".mov",
         ".wmv",
         ".mpg",
         ".mpeg",
+        ".m4a",
+        ".aac",
+        ".flac",
         ".mp3",
         ".wav",
         ".ogg",
+        # Web / ebooks / binaries often seen in course materials
+        ".html",
+        ".htm",
+        ".css",
+        ".epub",
+        ".mobi",
+        ".chm",
+        ".exe",
+        ".msi",
+        ".apk",
+        ".dmg",
     ]
+    EXTENSION_WHITELIST = set(COMMON_EXTENSIONS)
+    EXTENSION_ALIASES = {
+        ".jpe": ".jpg",
+        ".tif": ".tiff",
+        ".htm": ".html",
+    }
 
     # Simple magic-signature based detection (fast, no extra deps)
     MagicHit = namedtuple("MagicHit", ["mime", "ext"])
@@ -90,10 +178,85 @@ class Downloader:
 
     def _guess_from_magic(self, head: bytes) -> Optional[Tuple[str, str]]:
         """Return (mime, ext) if a known magic prefix matches."""
+        if not head:
+            return None
+
+        # MP4/ISO BMFF often has 'ftyp' at offset 4, not 0
+        if len(head) >= 12 and head[4:8] == b"ftyp":
+            return ("video/mp4", ".mp4")
+
         for sig, hit in self.MAGIC_PREFIXES.items():
             if head.startswith(sig):
                 return hit.mime, hit.ext
         return None
+
+    def _append_extension_with_collision_handling(
+        self, file_path: Path, ext: str
+    ) -> Path:
+        """Rename a file by appending extension safely, avoiding collisions."""
+        if not ext:
+            return file_path
+
+        ext = ext.strip().lower()
+        if not ext.startswith("."):
+            ext = f".{ext}"
+
+        if file_path.suffix.lower() == ext:
+            return file_path
+
+        target = file_path.with_name(file_path.name + ext)
+        if target == file_path:
+            return file_path
+
+        if target.exists():
+            stem = target.stem
+            suffix = target.suffix
+            parent = target.parent
+            index = 1
+            while True:
+                candidate = parent / f"{stem} ({index}){suffix}"
+                if not candidate.exists():
+                    target = candidate
+                    break
+                index += 1
+
+        file_path.rename(target)
+        return target
+
+    def _detect_and_append_extension_for_downloaded_file(
+        self, file_path: Path, content_type: Optional[str] = None
+    ) -> Path:
+        """Detect extension for suffix-less file and append it.
+
+        This is a post-download fallback to cover cases where URL/text/headers
+        do not provide extension information before writing.
+        """
+        if self._existing_extension(file_path.name):
+            return file_path
+
+        try:
+            with open(file_path, "rb") as f:
+                head = f.read(8192)
+        except Exception:
+            return file_path
+
+        chosen = self._choose_extension(file_path.name, content_type, head)
+        if not chosen:
+            return file_path
+
+        ext, source, _mime = chosen
+        if not ext:
+            return file_path
+
+        try:
+            renamed = self._append_extension_with_collision_handling(file_path, ext)
+            if renamed != file_path:
+                logger.debug(
+                    f"      [infer-post] '{file_path.name}' -> '{renamed.name}' via {source}"
+                )
+            return renamed
+        except Exception:
+            return file_path
 
     def _choose_extension(
         self, filename: str, content_type: Optional[str], head: Optional[bytes]
@@ -113,6 +276,7 @@ class Downloader:
             # Fix common None cases
             if not ext and content_type.startswith("image/jpeg"):
                 ext = ".jpg"
+            ext = self._normalize_extension(ext)
             if ext:
                 return (ext, "content-type", content_type.split(";", 1)[0].strip())
 
@@ -138,20 +302,31 @@ class Downloader:
     def _has_known_extension(self, name: str) -> bool:
         """Return True if name ends with a known extension from COMMON_EXTENSIONS."""
         base = name.rsplit("/", 1)[-1].lower()
-        return any(base.endswith(ext) for ext in self.COMMON_EXTENSIONS)
+        return any(base.endswith(ext) for ext in self.EXTENSION_WHITELIST)
+
+    def _normalize_extension(self, ext: Optional[str]) -> Optional[str]:
+        """Normalize extension and enforce whitelist."""
+        if not ext:
+            return None
+
+        norm = ext.strip().lower()
+        if not norm.startswith("."):
+            norm = f".{norm}"
+
+        norm = self.EXTENSION_ALIASES.get(norm, norm)
+        if norm in self.EXTENSION_WHITELIST:
+            return norm
+        return None
 
     def _existing_extension(self, name: str) -> Optional[str]:
         """Return the suffix found in name (e.g., '.pdf') if present and plausible; else None.
-        Plausible = dot + 2~6 alnum chars (covers most common cases like .pdf/.pptx/.mpeg etc.).
+        Avoid treating date fragments like '.25' as valid extensions.
         """
         try:
             ext = Path(name).suffix
         except Exception:
             ext = ""
-        ext = (ext or "").strip().lower()
-        if ext and 2 <= len(ext) <= 6 and re.fullmatch(r"\.[a-z0-9]+", ext):
-            return ext
-        return None
+        return self._normalize_extension(ext)
 
     def _filename_from_headers(self, content_disp: Optional[str]) -> Optional[str]:
         """Extract filename from Content-Disposition header if present."""
@@ -670,9 +845,19 @@ class Downloader:
                     )
                     return
             else:
-                # 用户没有选择任何标签页 - 跳过下载
-                logger.info(f"  No tabs selected, skipping download")
-                return
+                # 用户没有选择任何标签页：优先回退到“教学内容”避免整课被跳过
+                teaching_tab = next(
+                    (area for area in content_areas if area.get("name") == "教学内容"),
+                    None,
+                )
+                if teaching_tab:
+                    content_areas = [teaching_tab]
+                    logger.info("  No tabs selected, fallback to default tab: 教学内容")
+                else:
+                    logger.info(
+                        "  No tabs selected and no 教学内容 tab found, skipping download"
+                    )
+                    return
 
             # Phase 1: Scan all content areas to discover files
             self.progress["phase"] = "scanning"
@@ -1076,6 +1261,10 @@ class Downloader:
         # Overwrite/skip decision using preflight info
         if file_path.exists():
             if overwrite_mode == "never":
+                # Auto-heal legacy files lacking valid extension, even when skipped
+                file_path = self._detect_and_append_extension_for_downloaded_file(
+                    file_path, head_ct
+                )
                 self.stats["skipped"] += 1
                 self._increment_files_done()
                 skip_size = (
@@ -1097,6 +1286,12 @@ class Downloader:
             elif overwrite_mode == "size" and remote_size > -1:
                 try:
                     if file_path.stat().st_size == remote_size:
+                        # Auto-heal legacy files lacking valid extension, even when skipped
+                        file_path = (
+                            self._detect_and_append_extension_for_downloaded_file(
+                                file_path, head_ct
+                            )
+                        )
                         self.stats["skipped"] += 1
                         self._increment_files_done()
                         with self._progress_lock:
@@ -1220,6 +1415,11 @@ class Downloader:
                 except Exception:
                     pass
                 return False
+
+            # Post-download fallback: if file is still suffix-less, detect and append extension
+            file_path = self._detect_and_append_extension_for_downloaded_file(
+                file_path, response.headers.get("Content-Type")
+            )
 
             logger.info(f"      [OK] {file_path.name}")
             self.stats["downloaded"] += 1

@@ -407,11 +407,15 @@ class Downloader:
         if not file_path.exists() or file_path.stat().st_size <= 0:
             return False, None
 
-        dedupe_scope = str(self.config.get("md5_dedupe_scope", "course")).strip().lower()
+        dedupe_scope = (
+            str(self.config.get("md5_dedupe_scope", "course")).strip().lower()
+        )
         if dedupe_scope == "global":
             root_dir = Path(self.config.get("download_dir"))
         else:
-            root_dir = self.current_course_dir if self.current_course_dir else file_path.parent
+            root_dir = (
+                self.current_course_dir if self.current_course_dir else file_path.parent
+            )
 
         self._ensure_md5_index_for_root(root_dir)
 
@@ -1451,7 +1455,10 @@ class Downloader:
             same_size = cached_size > -1 and local_size == cached_size
 
             same_etag = bool(head_etag) and cached_meta.get("etag") == head_etag
-            same_lm = bool(head_last_modified) and cached_meta.get("last_modified") == head_last_modified
+            same_lm = (
+                bool(head_last_modified)
+                and cached_meta.get("last_modified") == head_last_modified
+            )
 
             if same_size and (same_etag or same_lm):
                 self.stats["skipped"] += 1
@@ -1508,7 +1515,9 @@ class Downloader:
                             url,
                             head_etag,
                             head_last_modified,
-                            file_path.stat().st_size if file_path.exists() else remote_size,
+                            file_path.stat().st_size
+                            if file_path.exists()
+                            else remote_size,
                         )
                         self.stats["skipped"] += 1
                         self._increment_files_done()
